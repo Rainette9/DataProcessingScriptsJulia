@@ -1,0 +1,844 @@
+using CSV
+using DataFrames
+using Dates
+using Statistics
+
+# Valid sensor identifiers
+const VALID_SENSORS = ["SFC", "LOWER", "UPPER", "BOTTOM"]
+
+"""
+    read_fast_data(; base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+                   sensor="SFC", start=nothing, end_time=nothing, return_units=false,
+                   max_files=nothing, dates=nothing)
+
+Read fast data files from folders containing the sensor name, with files containing 'fast'.
+
+The function expects CSV files in TOA5 format with the following columns:
+- TIMESTAMP, RECORD, Ux, Uy, Uz, Ts, diag_csat, LI_H2Om, LI_Pres, LI_diag
+
+# Arguments
+- `base_path::String`: Base directory path to search for data files
+- `sensor::Union{String, Vector{String}}`: Sensor identifier(s) - "SFC", "LOWER", "UPPER", or "BOTTOM" (default: "SFC"). Can be a single sensor or vector of sensors.
+- `start::Union{Nothing, DateTime}`: Start time filter (optional)
+- `end_time::Union{Nothing, DateTime}`: End time filter (optional)
+- `return_units::Bool`: If true, returns (DataFrame, Dict) with units information (default: false)
+- `max_files::Union{Nothing, Int}`: Maximum number of files to read (useful for testing/chunking) (optional)
+- `dates::Union{Nothing, Vector{Date}}`: Only read files containing data from these specific dates (optional)
+
+# Returns
+- `DataFrame`: Combined data from all matching files, or
+- `Tuple{DataFrame, Dict}`: If return_units=true, returns data and units dictionary
+
+# Example
+```julia
+# Read all data
+data = read_fast_data()
+
+# Read only 5 files for testing
+data = read_fast_data(max_files=5)
+
+# Read specific dates
+data = read_fast_data(dates=[Date(2025, 2, 9), Date(2025, 2, 10)])
+
+# Read from specific sensor
+data = read_fast_data(sensor="UPPER")
+
+# Read from multiple sensors
+data = read_fast_data(sensor=["SFC", "LOWER"])
+
+# Combine filters
+data = read_fast_data(sensor="LOWER", start=DateTime(2025, 2, 9), end_time=DateTime(2025, 2, 10), max_files=10)
+data, units = read_fast_data(base_path="/path/to/data", sensor="SFC", return_units=true)
+```
+"""
+function read_fast_data(; 
+    base_path=nothing,
+    sensor="SFC",
+    start=nothing, 
+    end_time=nothing,
+    return_units=false,
+    max_files=nothing,
+    dates=nothing)
+    
+    # Validate and normalize sensor input
+    sensors = _validate_sensors(sensor)
+    
+    data_frames = DataFrame[]
+    units_dict = Dict{String, String}()
+    files_read = 0
+    
+    # Walk through directory structure
+    for (root, dirs, files) in walkdir(base_path)
+        # Check if folder contains any of the specified sensor names
+        any(s -> occursin(s, root), sensors) || continue
+        
+        # Check if we've reached max_files limit
+        if !isnothing(max_files) && files_read >= max_files
+            println("Reached maximum file limit ($max_files files)")
+            break
+        end
+        
+        println("Reading data from: $root")
+        
+        # Process fast data files
+        for file_name in sort(filter(f -> _is_fast_file(f), files))
+            # Check max_files limit
+            if !isnothing(max_files) && files_read >= max_files
+                break
+            end
+            file_path = joinpath(root, file_name)
+            println("  Reading file: $file_name")
+            
+            try
+                # Read units if requested and not yet read
+                if return_units && isempty(units_dict)
+                    units_dict = _read_units(file_path)
+                end
+                
+                # Read data from TOA5 file
+                df = _read_toa5_file(file_path)
+                
+                # Filter by dates if specified (check before adding to save memory)
+                if !isnothing(dates)
+                    df_dates = unique(Date.(df.TIMESTAMP))
+                    # Only include if file contains data from requested dates
+                    if !any(d -> d in dates, df_dates)
+                        continue
+                    end
+                end
+                
+                push!(data_frames, df)
+                files_read += 1
+                
+            catch e
+                @warn "Error reading file $file_name" exception=(e, catch_backtrace())
+            end
+        end
+    end
+    
+    # Process combined data
+    combined_data = _process_dataframes(data_frames, start, end_time)
+    
+    return return_units ? (combined_data, units_dict) : combined_data
+end
+
+"""
+    read_slow_data(; base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+                   sensor="SFC", start=nothing, end_time=nothing, return_units=false,
+                   max_files=nothing, dates=nothing, merge_wind=true)
+
+Read slow data files from folders containing the sensor name, with files containing 'slow', 'Slow', 'SLOW', or 'OneMin'.
+
+The function expects CSV files in TOA5 format with typical slow data columns.
+
+# Arguments
+- `base_path::String`: Base directory path to search for data files
+- `sensor::Union{String, Vector{String}}`: Sensor identifier(s) - "SFC", "LOWER", "UPPER", or "BOTTOM" (default: "SFC")
+- `start::Union{Nothing, DateTime}`: Start time filter (optional)
+- `end_time::Union{Nothing, DateTime}`: End time filter (optional)
+- `return_units::Bool`: If true, returns (DataFrame, Dict) with units information (default: false)
+- `max_files::Union{Nothing, Int}`: Maximum number of files to read (useful for testing/chunking) (optional)
+- `dates::Union{Nothing, Vector{Date}}`: Only read files containing data from these specific dates (optional)
+- `merge_wind::Bool`: For SFC sensor, merge wind data files if available (default: true)
+
+# Returns
+- `DataFrame`: Combined data from all matching files, resampled to 1-minute intervals, or
+- `Tuple{DataFrame, Dict}`: If return_units=true, returns data and units dictionary
+
+# Example
+```julia
+# Read all slow data
+data = read_slow_data()
+
+# Read specific dates
+data = read_slow_data(dates=[Date(2025, 2, 9)])
+
+# Read without wind data merging
+data, units = read_slow_data(sensor="SFC", merge_wind=false, return_units=true)
+```
+"""
+function read_slow_data(; 
+    base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+    sensor="SFC",
+    start=nothing, 
+    end_time=nothing,
+    return_units=false,
+    max_files=nothing,
+    dates=nothing,
+    merge_wind=true)
+    
+    # Validate and normalize sensor input
+    sensors = _validate_sensors(sensor)
+    
+    data_frames = DataFrame[]
+    units_dict = Dict{String, String}()
+    units_wind_dict = Dict{String, String}()
+    files_read = 0
+    
+    # Walk through directory structure
+    for (root, dirs, files) in walkdir(base_path)
+        # Check if folder contains any of the specified sensor names
+        any(s -> occursin(s, root), sensors) || continue
+        
+        # Check if we've reached max_files limit
+        if !isnothing(max_files) && files_read >= max_files
+            println("Reached maximum file limit ($max_files files)")
+            break
+        end
+        
+        println("Reading slow data from: $root")
+        
+        # Process slow data files
+        for file_name in sort(filter(f -> _is_slow_file(f), files))
+            # Check max_files limit
+            if !isnothing(max_files) && files_read >= max_files
+                break
+            end
+            
+            file_path = joinpath(root, file_name)
+            println("  Reading file: $file_name")
+            
+            try
+                # Read units if requested and not yet read
+                if return_units && isempty(units_dict)
+                    units_dict = _read_units(file_path)
+                end
+                
+                # Read data from TOA5 file
+                df = _read_toa5_file(file_path)
+                
+                # For SFC sensor, try to merge wind data if requested
+                if merge_wind && "SFC" in sensors && occursin("SFC", root)
+                    df, wind_units = _merge_wind_data(df, file_name, root, files)
+                    if return_units && !isempty(wind_units)
+                        units_wind_dict = wind_units
+                    end
+                end
+                
+                # Filter by dates if specified
+                if !isnothing(dates)
+                    df_dates = unique(Date.(df.TIMESTAMP))
+                    if !any(d -> d in dates, df_dates)
+                        continue
+                    end
+                end
+                
+                push!(data_frames, df)
+                files_read += 1
+                
+            catch e
+                @warn "Error reading file $file_name" exception=(e, catch_backtrace())
+            end
+        end
+    end
+    
+    # Process combined data
+    combined_data = _process_slow_dataframes(data_frames, start, end_time)
+    
+    # Return with units if requested
+    if return_units
+        result_units = copy(units_dict)
+        if !isempty(units_wind_dict)
+            result_units["wind"] = units_wind_dict
+        end
+        return combined_data, result_units
+    else
+        return combined_data
+    end
+end
+
+# Helper function to validate and normalize sensor input
+function _validate_sensors(sensor::Union{String, Vector{String}})
+    # Convert to vector if single string
+    sensors = sensor isa String ? [sensor] : sensor
+    
+    # Validate each sensor
+    for s in sensors
+        if !(s in VALID_SENSORS)
+            error("Invalid sensor '$s'. Must be one of: $(join(VALID_SENSORS, ", "))")
+        end
+    end
+    
+    return sensors
+end
+
+# Helper function to check if file is a fast data file
+function _is_fast_file(filename::String)
+    contains_fast = occursin(r"fast"i, filename)
+    is_data_file = endswith(filename, ".dat") || endswith(filename, ".csv")
+    return contains_fast && is_data_file
+end
+
+# Helper function to read units from TOA5 file
+function _read_units(file_path::String)
+    units_row = CSV.read(file_path, DataFrame; 
+                        header=2, 
+                        limit=1,
+                        silencewarnings=true)
+    return Dict(col => string(units_row[1, col]) for col in names(units_row))
+end
+
+# Helper function to read TOA5 format file
+function _read_toa5_file(file_path::String)
+    # Read CSV file (TOA5: row 1=metadata, row 2=headers, row 3=units, row 4=processing, row 5+=data)
+    df = CSV.read(file_path, DataFrame; 
+                 header=2,
+                 skipto=5,
+                 silencewarnings=true,
+                 stringtype=String)
+    
+    # Parse timestamp
+    df.TIMESTAMP = DateTime.(df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+    
+    return df
+end
+
+# Helper function to process and combine dataframes
+function _process_dataframes(data_frames::Vector{DataFrame}, start, end_time)
+    if isempty(data_frames)
+        @warn "No data files found matching criteria"
+        return DataFrame()
+    end
+    
+    # Concatenate, remove duplicates, and sort
+    combined_data = vcat(data_frames...; cols=:union)
+    unique!(combined_data, :TIMESTAMP)
+    sort!(combined_data, :TIMESTAMP)
+    
+    # Apply time filters
+    if !isnothing(start)
+        filter!(row -> row.TIMESTAMP >= start, combined_data)
+    end
+    if !isnothing(end_time)
+        filter!(row -> row.TIMESTAMP <= end_time, combined_data)
+    end
+    
+    # Print summary
+    unique_dates = unique(Date.(combined_data.TIMESTAMP))
+    println("\nUnique dates: ", join(unique_dates, ", "))
+    println("Total records loaded: ", nrow(combined_data))
+    
+    return combined_data
+end
+
+# Helper function to check if file is a slow data file
+function _is_slow_file(filename::String)
+    contains_slow = occursin(r"(slow|Slow|SLOW|OneMin)"i, filename)
+    is_data_file = endswith(filename, ".dat") || endswith(filename, ".csv")
+    return contains_slow && is_data_file
+end
+
+# Helper function to merge wind data for SFC sensor
+function _merge_wind_data(main_df::DataFrame, file_name::String, root::String, all_files::Vector{String})
+    wind_units = Dict{String, String}()
+    
+    # Try to extract file number from filename
+    file_match = match(r"_(\d+)\.dat", file_name)
+    if isnothing(file_match)
+        file_match = match(r"_(\d+)", file_name)
+    end
+    
+    if !isnothing(file_match)
+        number = file_match.captures[1]
+        
+        # Look for wind file with same number
+        wind_pattern = "wind_$number"
+        wind_files = filter(f -> occursin(wind_pattern, f) && (endswith(f, ".dat") || endswith(f, ".csv")), all_files)
+        
+        if !isempty(wind_files)
+            wind_file = first(wind_files)
+            wind_file_path = joinpath(root, wind_file)
+            println("    Found matching wind file: $wind_file")
+            
+            try
+                # Read wind data
+                wind_df = CSV.read(wind_file_path, DataFrame; 
+                                  header=2,
+                                  skipto=5,
+                                  silencewarnings=true,
+                                  stringtype=String)
+                
+                # Parse timestamp
+                wind_df.TIMESTAMP = DateTime.(wind_df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+                
+                # Read wind units
+                wind_units = _read_units(wind_file_path)
+                
+                # Set TIMESTAMP as index for join
+                main_df_indexed = groupby(main_df, :TIMESTAMP)
+                wind_df_indexed = groupby(wind_df, :TIMESTAMP)
+                
+                # Join dataframes
+                merged_df = leftjoin(main_df, wind_df, on=:TIMESTAMP, makeunique=true)
+                
+                return merged_df, wind_units
+            catch e
+                @warn "Error merging wind data from $wind_file" exception=(e, catch_backtrace())
+                return main_df, wind_units
+            end
+        end
+    end
+    
+    # If no specific wind file found, try generic wind file
+    wind_files = filter(f -> occursin("wind", lowercase(f)) && (endswith(f, ".dat") || endswith(f, ".csv")), all_files)
+    
+    if !isempty(wind_files)
+        wind_file = first(wind_files)
+        wind_file_path = joinpath(root, wind_file)
+        println("    Found wind file: $wind_file")
+        
+        try
+            # Read and merge wind data
+            wind_df = CSV.read(wind_file_path, DataFrame; 
+                              header=2,
+                              skipto=5,
+                              silencewarnings=true,
+                              stringtype=String)
+            
+            wind_df.TIMESTAMP = DateTime.(wind_df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+            wind_units = _read_units(wind_file_path)
+            
+            merged_df = leftjoin(main_df, wind_df, on=:TIMESTAMP, makeunique=true)
+            return merged_df, wind_units
+        catch e
+            @warn "Error merging wind data from $wind_file" exception=(e, catch_backtrace())
+            return main_df, wind_units
+        end
+    end
+    
+    return main_df, wind_units
+end
+
+# Helper function to process and combine slow dataframes with resampling
+function _process_slow_dataframes(data_frames::Vector{DataFrame}, start, end_time)
+    if isempty(data_frames)
+        @warn "No data files found matching criteria"
+        return DataFrame()
+    end
+    
+    # Concatenate, remove duplicates, and sort
+    combined_data = vcat(data_frames...; cols=:union)
+    unique!(combined_data, :TIMESTAMP)
+    sort!(combined_data, :TIMESTAMP)
+    
+    # Apply time filters before resampling
+    if !isnothing(start)
+        filter!(row -> row.TIMESTAMP >= start, combined_data)
+    end
+    if !isnothing(end_time)
+        filter!(row -> row.TIMESTAMP <= end_time, combined_data)
+    end
+    
+    # Resample to 1-minute intervals (mean aggregation)
+    if nrow(combined_data) > 0
+        println("Resampling slow data to 1-minute intervals...")
+        
+        # Group by 1-minute periods and calculate means
+        combined_data.minute_timestamp = floor.(combined_data.TIMESTAMP, Minute(1))
+        
+        # Get numeric columns (exclude TIMESTAMP and minute_timestamp)
+        numeric_cols = names(combined_data, Real)
+        grouping_cols = [:minute_timestamp]
+        
+        # Aggregate by mean for numeric columns
+        resampled = combine(groupby(combined_data, :minute_timestamp)) do sdf
+            result = DataFrame()
+            for col in numeric_cols
+                if col != :minute_timestamp
+                    result[!, col] = [mean(skipmissing(sdf[!, col]))]
+                end
+            end
+            return result
+        end
+        
+        # Rename minute_timestamp back to TIMESTAMP
+        rename!(resampled, :minute_timestamp => :TIMESTAMP)
+        combined_data = resampled
+    end
+    
+    # Print summary
+    unique_dates = unique(Date.(combined_data.TIMESTAMP))
+    println("\nUnique dates: ", join(unique_dates, ", "))
+    println("Total records after 1-min resampling: ", nrow(combined_data))
+    
+    return combined_data
+end
+
+"""
+    list_available_dates(; base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted", 
+                         sensor="SFC")
+
+List all available dates in the dataset without loading the data. Useful for planning chunked reads.
+
+# Arguments
+- `base_path::String`: Base directory path to search for data files
+- `sensor::Union{String, Vector{String}}`: Sensor identifier(s) - "SFC", "LOWER", "UPPER", or "BOTTOM" (default: "SFC")
+
+# Returns
+- `Vector{Date}`: Sorted vector of dates found in the data files
+"""
+function list_available_dates(; 
+    base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+    sensor="SFC")
+    
+    # Validate and normalize sensor input
+    sensors = _validate_sensors(sensor)
+    
+    all_dates = Set{Date}()
+    
+    for (root, dirs, files) in walkdir(base_path)
+        any(s -> occursin(s, root), sensors) || continue
+        
+        for file_name in filter(f -> _is_fast_file(f), files)
+            file_path = joinpath(root, file_name)
+            
+            try
+                # Read just first and last few rows to get date range
+                df_sample = CSV.read(file_path, DataFrame; 
+                                    header=2,
+                                    skipto=5,
+                                    limit=10,
+                                    silencewarnings=true,
+                                    select=["TIMESTAMP"])
+                
+                timestamps = DateTime.(df_sample.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+                for ts in timestamps
+                    push!(all_dates, Date(ts))
+                end
+            catch e
+                continue
+            end
+        end
+    end
+    
+    dates = sort(collect(all_dates))
+    println("Found $(length(dates)) unique dates")
+    return dates
+end
+
+"""
+    read_fast_data_by_day(process_func; base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+                          sensor="SFC", dates=nothing)
+
+Process fast data one day at a time using a custom processing function. Memory efficient for large datasets.
+
+# Arguments
+- `process_func::Function`: Function that takes a DataFrame and date, processes it, and returns results
+- `base_path::String`: Base directory path
+- `sensor::Union{String, Vector{String}}`: Sensor identifier(s) - "SFC", "LOWER", "UPPER", or "BOTTOM" (default: "SFC")
+- `dates::Union{Nothing, Vector{Date}}`: Specific dates to process (optional, processes all if nothing)
+
+# Returns
+- `Vector`: Results from process_func for each day
+
+# Example
+```julia
+# Calculate daily means
+results = read_fast_data_by_day(sensor="SFC") do df, date
+    return (date=date, mean_Ux=mean(skipmissing(df.Ux)), n_records=nrow(df))
+end
+
+# Save each day to separate file
+read_fast_data_by_day(sensor="SFC") do df, date
+    CSV.write("output_\$date.csv", df)
+    return nothing
+end
+```
+"""
+function read_fast_data_by_day(process_func; 
+    base_path="/home/engbers/Documents/PhD/EC_data_convert/2025_2026/converted",
+    sensor="SFC",
+    dates=nothing)
+    
+    # Get available dates if not specified
+    if isnothing(dates)
+        dates = list_available_dates(base_path=base_path, sensor=sensor)
+    end
+    
+    results = []
+    
+    for date in dates
+        println("\nProcessing date: $date")
+        
+        # Read data for this specific date
+        df = read_fast_data(
+            base_path=base_path,
+            sensor=sensor,
+            dates=[date],
+            return_units=false
+        )
+        
+        if nrow(df) == 0
+            @warn "No data found for $date"
+            continue
+        end
+        
+        # Process the day's data
+        result = process_func(df, date)
+        push!(results, result)
+        
+        # Explicit garbage collection to free memory
+        df = nothing
+        GC.gc()
+    end
+    
+    return results
+end
+
+# ===== Slow Data Cleaning Functions =====
+
+"""
+    despike_snow_height(data::DataFrame, column_name::String="HS_Cor")
+
+Despike snow height data using a one-day moving median filter.
+
+Applies a 1-day rolling median filter, removes values above 2m, and interpolates missing values.
+
+# Arguments
+- `data::DataFrame`: Input DataFrame containing snow height data
+- `column_name::String`: Name of column containing snow height data (default: "HS_Cor")
+
+# Returns
+- `Vector`: Despiked snow height data
+
+# Example
+```julia
+cleaned_hs = despike_snow_height(slowdata, "HS_Cor")
+```
+"""
+function despike_snow_height(data::DataFrame, column_name::String="HS_Cor")
+    if !(column_name in names(data))
+        error("Column '$column_name' not found in the DataFrame.")
+    end
+    
+    # Create a copy of the column
+    snow_height = copy(data[!, column_name])
+    
+    # Apply 1-day moving median filter
+    # Assuming data is at 1-minute intervals, 1 day = 1440 points
+    window_size = 1440  # 1 day at 1-minute resolution
+    
+    # Calculate rolling median
+    n = length(snow_height)
+    median_filtered = similar(snow_height)
+    
+    for i in 1:n
+        # Calculate window bounds (centered)
+        half_window = div(window_size, 2)
+        start_idx = max(1, i - half_window)
+        end_idx = min(n, i + half_window)
+        
+        # Get window data, removing missing values and collecting to array
+        window_data = collect(skipmissing(snow_height[start_idx:end_idx]))
+        
+        # Calculate median if we have data
+        if !isempty(window_data)
+            median_filtered[i] = median(window_data)
+        else
+            median_filtered[i] = missing
+        end
+    end
+    
+    # Remove values above 2m
+    median_filtered = ifelse.(coalesce.(median_filtered .> 2.0, false), missing, median_filtered)
+    
+    # Interpolate missing values
+    median_filtered = _interpolate_linear(median_filtered)
+    
+    return median_filtered
+end
+
+"""
+    clean_slowdata(slowdata::DataFrame)
+
+Clean slow data by removing outliers and filtering based on quality checks.
+
+Performs the following operations:
+- Selects relevant columns
+- Converts wind speed from km/h to m/s
+- Applies bounds checks to radiation variables
+- Ensures physical consistency (e.g., SWdown > SWup)
+- Filters snow height based on quality flag
+- Applies despiking to snow height
+- Interpolates filtered values
+
+# Arguments
+- `slowdata::DataFrame`: Input slow data DataFrame
+
+# Returns
+- `DataFrame`: Cleaned slow data
+
+# Example
+```julia
+cleaned_data = clean_slowdata(slowdata)
+```
+"""
+function clean_slowdata(slowdata::DataFrame)
+    # Select columns based on whether SFTempK exists
+    if "SFTempK" in names(slowdata)
+        selected_cols = ["WD1", "WD2", "TA", "RH", "HS_Cor", "HS_Qty", "SFTempK",
+                        "SWdown1", "SWdown2", "SWup1", "SWup2",
+                        "LWdown1", "LWdown2", "LWup1", "LWup2", 
+                        "SWdn", "PF_FC4", "WS_FC4",
+                        "WS1_Avg", "WS2_Avg", "WS1_Max", "WS2_Max", "WS1_Std", "WS2_Std"]
+    else
+        selected_cols = ["WD1", "WD2", "TA", "RH", "HS_Cor", "HS_Qty",
+                        "SWdown1", "SWdown2", "SWup1", "SWup2", 
+                        "LWdown1", "LWdown2", "LWup1", "LWup2", 
+                        "SWdn", "PF_FC4", "WS_FC4", 
+                        "WS1_Avg", "WS2_Avg", "WS1_Max", "WS2_Max", "WS1_Std", "WS2_Std"]
+    end
+    
+    # Keep TIMESTAMP if it exists
+    if "TIMESTAMP" in names(slowdata)
+        pushfirst!(selected_cols, "TIMESTAMP")
+    end
+    
+    # Filter to only columns that exist in the data
+    existing_cols = filter(col -> col in names(slowdata), selected_cols)
+    slowdata_cleaned = select(slowdata, existing_cols, copycols=true)
+    
+    # Convert WS_FC4 from km/h to m/s
+    if "WS_FC4" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "WS_FC4"] = slowdata_cleaned[!, "WS_FC4"] ./ 3.6
+    end
+    
+    # Apply bounds for shortwave radiation (SW: -20 to 1300 W/m²)
+    for var in ["SWdown1", "SWdown2", "SWup1", "SWup2"]
+        if var in names(slowdata_cleaned)
+            slowdata_cleaned[!, var] = ifelse.(
+                coalesce.((slowdata_cleaned[!, var] .> 1300) .| (slowdata_cleaned[!, var] .< -20), false),
+                missing,
+                slowdata_cleaned[!, var]
+            )
+        end
+    end
+    
+    # Apply bounds for longwave radiation (LW: 10 to 400 W/m²)
+    for var in ["LWdown1", "LWdown2", "LWup1", "LWup2"]
+        if var in names(slowdata_cleaned)
+            slowdata_cleaned[!, var] = ifelse.(
+                coalesce.((slowdata_cleaned[!, var] .> 400) .| (slowdata_cleaned[!, var] .< 10), false),
+                missing,
+                slowdata_cleaned[!, var]
+            )
+        end
+    end
+    
+    # Check that SWdown > SWup (physically meaningful)
+    if "SWdown1" in names(slowdata_cleaned) && "SWup1" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "SWdown1"] = ifelse.(
+            coalesce.(slowdata_cleaned[!, "SWdown1"] .<= slowdata_cleaned[!, "SWup1"], false),
+            missing,
+            slowdata_cleaned[!, "SWdown1"]
+        )
+        slowdata_cleaned[!, "SWdown1"] = _interpolate_linear(slowdata_cleaned[!, "SWdown1"])
+    end
+    
+    if "SWdown2" in names(slowdata_cleaned) && "SWup2" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "SWdown2"] = ifelse.(
+            coalesce.(slowdata_cleaned[!, "SWdown2"] .<= slowdata_cleaned[!, "SWup2"], false),
+            missing,
+            slowdata_cleaned[!, "SWdown2"]
+        )
+        slowdata_cleaned[!, "SWdown2"] = _interpolate_linear(slowdata_cleaned[!, "SWdown2"])
+    end
+    
+    # Apply bounds for surface temperature (210-283 K)
+    if "SFTempK" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "SFTempK"] = ifelse.(
+            coalesce.((slowdata_cleaned[!, "SFTempK"] .> 283) .| (slowdata_cleaned[!, "SFTempK"] .< 210), false),
+            missing,
+            slowdata_cleaned[!, "SFTempK"]
+        )
+    end
+    
+    # Apply bounds for air temperature (>= -60°C)
+    if "TA" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "TA"] = ifelse.(
+            coalesce.(slowdata_cleaned[!, "TA"] .< -60, false),
+            missing,
+            slowdata_cleaned[!, "TA"]
+        )
+    end
+    
+    # Filter snow height based on quality flag and despike
+    if "HS_Cor" in names(slowdata_cleaned) && "HS_Qty" in names(slowdata_cleaned)
+        slowdata_cleaned[!, "HS_Cor"] = ifelse.(
+            coalesce.((slowdata_cleaned[!, "HS_Qty"] .< 152) .| (slowdata_cleaned[!, "HS_Qty"] .> 210), false),
+            missing,
+            slowdata_cleaned[!, "HS_Cor"]
+        )
+        
+        # Apply despiking
+        slowdata_cleaned[!, "HS_Cor"] = despike_snow_height(slowdata_cleaned, "HS_Cor")
+        
+        # Drop quality column
+        select!(slowdata_cleaned, Not("HS_Qty"))
+    end
+    
+    println("✓ Slow data cleaned")
+    println("  Cleaned columns: ", join(names(slowdata_cleaned), ", "))
+    
+    return slowdata_cleaned
+end
+
+# Helper function for linear interpolation
+function _interpolate_linear(data::AbstractVector)
+    result = copy(data)
+    n = length(result)
+    
+    # Find first non-missing value
+    first_valid = findfirst(!ismissing, result)
+    if isnothing(first_valid)
+        return result  # All missing
+    end
+    
+    # Find last non-missing value
+    last_valid = findlast(!ismissing, result)
+    if isnothing(last_valid) || first_valid == last_valid
+        return result  # Only one valid value or none
+    end
+    
+    # Interpolate between valid points
+    i = first_valid
+    while i <= last_valid
+        if ismissing(result[i])
+            # Find the previous non-missing value
+            j = i - 1
+            while j >= first_valid && ismissing(result[j])
+                j -= 1
+            end
+            prev_idx = j
+            
+            # Find next non-missing value
+            k = i + 1
+            while k <= last_valid && ismissing(result[k])
+                k += 1
+            end
+            next_idx = k
+            
+            # Linear interpolation
+            if prev_idx >= first_valid && next_idx <= last_valid
+                y0 = result[prev_idx]
+                y1 = result[next_idx]
+                span = next_idx - prev_idx
+                
+                for m in (prev_idx+1):(next_idx-1)
+                    if ismissing(result[m])
+                        alpha = (m - prev_idx) / span
+                        result[m] = y0 + alpha * (y1 - y0)
+                    end
+                end
+                
+                i = next_idx
+            else
+                i += 1
+            end
+        else
+            i += 1
+        end
+    end
+    
+    return result
+end
