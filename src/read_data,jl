@@ -79,37 +79,90 @@ function read_fast_data(;
         end
         
         println("Reading data from: $root")
-        
-        # Process fast data files
-        for file_name in sort(filter(f -> _is_fast_file(f), files))
+
+        # Sort fast files numerically (chronological order)
+        fast_files = _sort_numeric(filter(f -> _is_fast_file(f), files))
+
+        # When dates are specified, pre-scan to find the relevant file range.
+        # Read only the first timestamp from each file (very fast) and determine
+        # which files to fully read. Files are chronologically ordered by number.
+        if !isnothing(dates)
+            target_start = minimum(dates)
+            target_end   = maximum(dates)
+            first_idx = nothing
+            last_idx  = nothing
+
+            for (idx, file_name) in enumerate(fast_files)
+                file_path = joinpath(root, file_name)
+                try
+                    sample = CSV.read(file_path, DataFrame;
+                                      header=2, skipto=5, limit=1,
+                                      silencewarnings=true, select=["TIMESTAMP"])
+                    file_date = Date(DateTime(sample.TIMESTAMP[1],
+                                              dateformat"yyyy-mm-dd HH:MM:SS.s"))
+                    # First file whose date is >= target_start (or earlier — might span)
+                    if isnothing(first_idx) && file_date >= target_start
+                        # Include the previous file too, it might span into our date
+                        first_idx = max(1, idx - 1)
+                    end
+                    # Once past target_end, we know the previous file was the last
+                    if file_date > target_end
+                        last_idx = idx  # include this one too (might span)
+                        break
+                    end
+                catch
+                    continue
+                end
+            end
+
+            # Fallback: if we never found a start, dates might be before all files
+            if isnothing(first_idx)
+                first_idx = 1
+            end
+            if isnothing(last_idx)
+                last_idx = length(fast_files)
+            end
+
+            fast_files = fast_files[first_idx:last_idx]
+            println("  Pre-scan: reading files $(first_idx) to $(last_idx) of $(length(filter(f -> _is_fast_file(f), files))) (dates $target_start to $target_end)")
+        end
+
+        # Read the selected files
+        found_matching = false
+        for file_name in fast_files
             # Check max_files limit
             if !isnothing(max_files) && files_read >= max_files
                 break
             end
             file_path = joinpath(root, file_name)
             println("  Reading file: $file_name")
-            
+
             try
                 # Read units if requested and not yet read
                 if return_units && isempty(units_dict)
                     units_dict = _read_units(file_path)
                 end
-                
+
                 # Read data from TOA5 file
                 df = _read_toa5_file(file_path)
-                
-                # Filter by dates if specified (check before adding to save memory)
+
+                # Filter by dates if specified
                 if !isnothing(dates)
                     df_dates = unique(Date.(df.TIMESTAMP))
-                    # Only include if file contains data from requested dates
                     if !any(d -> d in dates, df_dates)
+                        # If we already found matching data and this file is past
+                        # our dates, stop — files are chronological
+                        if found_matching
+                            break
+                        end
                         continue
                     end
+                    found_matching = true
                 end
-                
+
                 push!(data_frames, df)
                 files_read += 1
-                
+
             catch e
                 @warn "Error reading file $file_name" exception=(e, catch_backtrace())
             end
@@ -268,6 +321,16 @@ function _is_fast_file(filename::String)
     is_data_file = endswith(filename, ".dat") || endswith(filename, ".csv")
     return contains_fast && is_data_file
 end
+
+# Helper: extract numeric suffix from filename for chronological sorting
+# e.g. "TOA5_STN1fast_1023.dat" → 1023
+function _file_number(filename::String)
+    m = match(r"_(\d+)\.\w+$", filename)
+    return isnothing(m) ? 0 : parse(Int, m.captures[1])
+end
+
+# Sort filenames numerically by their trailing number
+_sort_numeric(files) = sort(files; by=_file_number)
 
 # Helper function to read units from TOA5 file
 function _read_units(file_path::String)
@@ -489,7 +552,7 @@ function list_available_dates(;
     for (root, dirs, files) in walkdir(base_path)
         any(s -> occursin(s, root), sensors) || continue
         
-        for file_name in filter(f -> _is_fast_file(f), files)
+        for file_name in _sort_numeric(filter(f -> _is_fast_file(f), files))
             file_path = joinpath(root, file_name)
             
             try
@@ -674,29 +737,8 @@ cleaned_data = clean_slowdata(slowdata)
 ```
 """
 function clean_slowdata(slowdata::DataFrame)
-    # Select columns based on whether SFTempK exists
-    if "SFTempK" in names(slowdata)
-        selected_cols = ["WD1", "WD2", "TA", "RH", "HS_Cor", "HS_Qty", "SFTempK",
-                        "SWdown1", "SWdown2", "SWup1", "SWup2",
-                        "LWdown1", "LWdown2", "LWup1", "LWup2", 
-                        "SWdn", "PF_FC4", "WS_FC4",
-                        "WS1_Avg", "WS2_Avg", "WS1_Max", "WS2_Max", "WS1_Std", "WS2_Std"]
-    else
-        selected_cols = ["WD1", "WD2", "TA", "RH", "HS_Cor", "HS_Qty",
-                        "SWdown1", "SWdown2", "SWup1", "SWup2", 
-                        "LWdown1", "LWdown2", "LWup1", "LWup2", 
-                        "SWdn", "PF_FC4", "WS_FC4", 
-                        "WS1_Avg", "WS2_Avg", "WS1_Max", "WS2_Max", "WS1_Std", "WS2_Std"]
-    end
-    
-    # Keep TIMESTAMP if it exists
-    if "TIMESTAMP" in names(slowdata)
-        pushfirst!(selected_cols, "TIMESTAMP")
-    end
-    
-    # Filter to only columns that exist in the data
-    existing_cols = filter(col -> col in names(slowdata), selected_cols)
-    slowdata_cleaned = select(slowdata, existing_cols, copycols=true)
+    # Start with all columns — no whitelist, so wind columns etc. are preserved
+    slowdata_cleaned = copy(slowdata)
     
     # Convert WS_FC4 from km/h to m/s
     if "WS_FC4" in names(slowdata_cleaned)
