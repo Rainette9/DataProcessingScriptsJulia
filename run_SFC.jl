@@ -10,6 +10,7 @@ using CSV
 
 include("process_sensor.jl")
 include("src/read_data,jl")
+include("save_data.jl")
 
 # === Configuration ===
 input_base       = "/home/engbers/Documents/PhD/EC_data_convert/2025/converted"
@@ -23,6 +24,11 @@ slow_data = clean_slowdata(slow_raw)
 unique!(slow_data, :TIMESTAMP)
 sort!(slow_data, :TIMESTAMP)
 println("  $(nrow(slow_data)) slow records loaded")
+
+# === Save slow data (including wind columns) ===
+slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_slow/SFC"
+println("Saving slow data (OneMin) with wind columns...")
+save_slow_data(slow_data, slow_output, "SFC")
 
 # === Process ===
 # Pass --restart to reprocess all dates; default resumes from where it left off.

@@ -341,6 +341,7 @@ function process_sensor(;
             end
             reset!(logger)
 
+
         catch e
             push!(failed_days, date)
             @warn "Failed to process $date" exception=(e, catch_backtrace())
@@ -411,11 +412,19 @@ function _write_hourly_files(hf_result::DimArray, out_base::String, sensor::Stri
         matrix = fill(NaN, rows_per_hour, n_vars)
 
         # Copy available data into the matrix
+        has_data = false
         for (row, t) in enumerate(full_times)
             idx = get(time_index, t, 0)
             if idx > 0
                 @views matrix[row, :] .= raw_matrix[idx, :]
+                has_data = true
             end
+        end
+
+        # Skip hours with no data at all
+        if !has_data
+            t_hour += Hour(1)
+            continue
         end
 
         # Build DataFrame

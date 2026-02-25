@@ -7,7 +7,7 @@ For each day of processed SFC fast data:
 2. Concatenate into a single DimArray.
 3. Run Orthogonal MRD (M=16, normalize=true).
 4. Write per-scale summary statistics (median/q25/q75) -> MRD_SFC_<date>.dat
-5. Save a summary plot -> MRD_SFC_<date>.pdf
+5. Save a summary plot -> MRD_SFC_<date>.png
 """
 
 using Peddy, Dates, Statistics, CSV, DataFrames
@@ -17,7 +17,7 @@ using LaTeXStrings
 using Glob
 
 # === Configuration ===
-sensor       = "SFC"
+sensor       = "LOWER"
 input_base   = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor"
 output_path  = "/home/engbers/Documents/PhD/EC_data_convert/2025/MRD/$sensor"
 mkpath(output_path)
@@ -144,10 +144,10 @@ dates = sort(collect(keys(files_by_date)))
 for (i, date) in enumerate(dates)
     date_str = Dates.format(date, "yyyy-mm-dd")
     dat_file = joinpath(output_path, "MRD_$(sensor)_$(date_str).dat")
-    pdf_file = joinpath(output_path, "MRD_$(sensor)_$(date_str).pdf")
+    png_file = joinpath(output_path, "MRD_$(sensor)_$(date_str).png")
 
     # Skip if both outputs already exist
-    if isfile(dat_file) && isfile(pdf_file)
+    if isfile(dat_file) && isfile(png_file)
         println("  [$i/$(length(dates))] $date — already done, skipping")
         continue
     end
@@ -164,7 +164,8 @@ for (i, date) in enumerate(dates)
         println("  $(length(day_files)) files, $n_times samples")
 
         # Run MRD
-        mrd = Peddy.OrthogonalMRD(M=16, normalize=true)
+        shift = round(Int, 0.1 * 2^17)
+        mrd = Peddy.OrthogonalMRD(M=17, shift=shift, normalize=true, regular_grid=true)
         Peddy.decompose!(mrd, day_data, nothing)
         res = Peddy.get_mrd_results(mrd)
 
@@ -176,9 +177,9 @@ for (i, date) in enumerate(dates)
         # Summarize and write
         summary = summarize_mrd(res)
         write_mrd_dat(summary, dat_file)
-        plot_mrd_summary(summary, date, pdf_file)
+        plot_mrd_summary(summary, date, png_file)
         println("  Wrote $dat_file")
-        println("  Wrote $pdf_file")
+        println("  Wrote $png_file")
 
     catch e
         @warn "Failed MRD for $date" exception=(e, catch_backtrace())

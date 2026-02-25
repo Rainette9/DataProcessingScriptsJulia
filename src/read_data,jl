@@ -98,8 +98,7 @@ function read_fast_data(;
                     sample = CSV.read(file_path, DataFrame;
                                       header=2, skipto=5, limit=1,
                                       silencewarnings=true, select=["TIMESTAMP"])
-                    file_date = Date(DateTime(sample.TIMESTAMP[1],
-                                              dateformat"yyyy-mm-dd HH:MM:SS.s"))
+                    file_date = Date(_fix_timestamp(sample.TIMESTAMP[1]))
                     # First file whose date is >= target_start (or earlier — might span)
                     if isnothing(first_idx) && file_date >= target_start
                         # Include the previous file too, it might span into our date
@@ -341,18 +340,35 @@ function _read_units(file_path::String)
     return Dict(col => string(units_row[1, col]) for col in names(units_row))
 end
 
+# Fix a raw TIMESTAMP string from a TOA5 file:
+#   - strips surrounding double-quotes (some files include them)
+#   - converts hour=24 notation (e.g. "2026-02-20 24:00:01.8") to the
+#     correct next-day time  ("2026-02-21 00:00:01.8")
+function _fix_timestamp(s::AbstractString)
+    s = String(strip(s, '"'))
+    # Handle hour=24 notation (e.g. "2026-02-20 24:00:01.8" → "2026-02-21 00:00:01.8")
+    m = match(r"^(\d{4}-\d{2}-\d{2}) 24:(.+)$", s)
+    if !isnothing(m)
+        base_date = Date(m.captures[1], dateformat"yyyy-mm-dd") + Day(1)
+        s = string(base_date) * " 00:" * m.captures[2]
+    end
+    # Auto-detect format: newer files omit fractional seconds
+    fmt = length(s) > 19 ? dateformat"yyyy-mm-dd HH:MM:SS.s" : dateformat"yyyy-mm-dd HH:MM:SS"
+    return DateTime(s, fmt)
+end
+
 # Helper function to read TOA5 format file
 function _read_toa5_file(file_path::String)
     # Read CSV file (TOA5: row 1=metadata, row 2=headers, row 3=units, row 4=processing, row 5+=data)
-    df = CSV.read(file_path, DataFrame; 
+    df = CSV.read(file_path, DataFrame;
                  header=2,
                  skipto=5,
                  silencewarnings=true,
                  stringtype=String)
-    
-    # Parse timestamp
-    df.TIMESTAMP = DateTime.(df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
-    
+
+    # Parse timestamp (handles quoted strings and hour=24 notation)
+    df.TIMESTAMP = _fix_timestamp.(df.TIMESTAMP)
+
     return df
 end
 
@@ -422,7 +438,7 @@ function _merge_wind_data(main_df::DataFrame, file_name::String, root::String, a
                                   stringtype=String)
                 
                 # Parse timestamp
-                wind_df.TIMESTAMP = DateTime.(wind_df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+                wind_df.TIMESTAMP = _fix_timestamp.(wind_df.TIMESTAMP)
                 
                 # Read wind units
                 wind_units = _read_units(wind_file_path)
@@ -500,7 +516,9 @@ function _process_slow_dataframes(data_frames::Vector{DataFrame}, start, end_tim
         combined_data.minute_timestamp = floor.(combined_data.TIMESTAMP, Minute(1))
         
         # Get numeric columns (exclude TIMESTAMP and minute_timestamp)
-        numeric_cols = names(combined_data, Real)
+        # Use Union{Missing, <:Real} to also capture columns from leftjoin
+        numeric_cols = [n for n in names(combined_data)
+                        if nonmissingtype(eltype(combined_data[!, n])) <: Real]
         grouping_cols = [:minute_timestamp]
         
         # Aggregate by mean for numeric columns
@@ -564,7 +582,7 @@ function list_available_dates(;
                                     silencewarnings=true,
                                     select=["TIMESTAMP"])
                 
-                timestamps = DateTime.(df_sample.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
+                timestamps = _fix_timestamp.(df_sample.TIMESTAMP)
                 for ts in timestamps
                     push!(all_dates, Date(ts))
                 end
@@ -789,7 +807,7 @@ function clean_slowdata(slowdata::DataFrame)
     # Apply bounds for surface temperature (210-283 K)
     if "SFTempK" in names(slowdata_cleaned)
         slowdata_cleaned[!, "SFTempK"] = ifelse.(
-            coalesce.((slowdata_cleaned[!, "SFTempK"] .> 283) .| (slowdata_cleaned[!, "SFTempK"] .< 210), false),
+            coalesce.((slowdata_cleaned[!, "SFTempK"] .> 275) .| (slowdata_cleaned[!, "SFTempK"] .< 210), false),
             missing,
             slowdata_cleaned[!, "SFTempK"]
         )
@@ -798,7 +816,7 @@ function clean_slowdata(slowdata::DataFrame)
     # Apply bounds for air temperature (>= -60°C)
     if "TA" in names(slowdata_cleaned)
         slowdata_cleaned[!, "TA"] = ifelse.(
-            coalesce.(slowdata_cleaned[!, "TA"] .< -60, false),
+            coalesce.(slowdata_cleaned[!, "TA"] .< -55, false),
             missing,
             slowdata_cleaned[!, "TA"]
         )
@@ -818,11 +836,80 @@ function clean_slowdata(slowdata::DataFrame)
         # Drop quality column
         select!(slowdata_cleaned, Not("HS_Qty"))
     end
-    
+
+    # Drop columns not needed for analysis
+    drop_cols = ["RECORD", "RECORD_1", "BattV_Min", "PTemp_Avg", "PowerSPC", "PowerLIC", "PowerHtr",
+                 "rmcutcdate", "rmcutctime", "rmclatitude", "rmclongitude",
+                 "Ux_Std", "Uy_Std", "Uz_Std", "Ts_Std",
+                 "n_Tot", "csat_warnings",
+                 "LI_CO2m_Avg", "LI_H2Om_Avg", "LI_CO2m_Std", "LI_H2Om_Std", "LI_Pres_Std"]
+    existing_drop = filter(c -> c in names(slowdata_cleaned), drop_cols)
+    if !isempty(existing_drop)
+        select!(slowdata_cleaned, Not(existing_drop))
+    end
+
     println("✓ Slow data cleaned")
     println("  Cleaned columns: ", join(names(slowdata_cleaned), ", "))
     
     return slowdata_cleaned
+end
+
+"""
+    clean_tower_slowdata(slowdata::DataFrame, suffix::String)
+
+Clean slow data for tower sensors (LOWER, UPPER, BOTTOM).
+Suffix is the height tag, e.g. "_16m", "_26m", "_5m".
+
+Performs:
+- Physical bounds on Temp_{h}m_Avg: -60 to 20 °C
+- Converts FluxWind columns from km/h to m/s
+- Drops diagnostic, redundant, and metadata columns
+"""
+function clean_tower_slowdata(slowdata::DataFrame, suffix::String)
+    cleaned = copy(slowdata)
+
+    # Temperature bounds: Temp_{h}m_Avg between -60 and 20 °C
+    temp_col = "Temp$(suffix)_Avg"
+    if temp_col in names(cleaned)
+        cleaned[!, temp_col] = ifelse.(
+            coalesce.((cleaned[!, temp_col] .> 20) .| (cleaned[!, temp_col] .< -60), false),
+            missing,
+            cleaned[!, temp_col]
+        )
+    end
+
+    # Convert FluxWind columns from km/h to m/s (only LOWER has these)
+    wind_kmh_patterns = ["WindMin_", "WindMean_", "WindMax_", "FC_Wind_"]
+    for c in names(cleaned)
+        if any(p -> startswith(c, p), wind_kmh_patterns)
+            cleaned[!, c] = cleaned[!, c] ./ 3.6
+        end
+    end
+
+    # Drop unwanted columns
+    drop_cols = [
+        "RECORD", "BattV_L_Min", "BattV_U_Min", "BattV_B_Min",
+        "PTemp_L_Avg", "PTemp_U_Avg", "PTemp_B_Avg",
+        "LI_CO2m$(suffix)_Avg", "LI_diag$(suffix)_Avg",
+        "LI_CO2m$(suffix)_Std", "LI_H2Om$(suffix)_Std",
+        "LI_Pres$(suffix)_Std", "LI_diag$(suffix)_Std",
+        "wnd_dir_compass$(suffix)", "wnd_dir_csat3$(suffix)",
+        "rslt_wnd_spd$(suffix)", "std_wnd_dir$(suffix)",
+        "csat_warnings$(suffix)",
+        "delT_f_Tot$(suffix)", "sigl_f_Tot$(suffix)",
+        "amph_f_Tot$(suffix)", "ampl_f_Tot$(suffix)",
+        "li_chopper$(suffix)", "li_detector$(suffix)",
+        "li_pll$(suffix)", "li_sync$(suffix)",
+    ]
+    existing_drop = filter(c -> c in names(cleaned), drop_cols)
+    if !isempty(existing_drop)
+        select!(cleaned, Not(existing_drop))
+    end
+
+    println("✓ Tower slow data cleaned (suffix=$suffix)")
+    println("  Cleaned columns: ", join(names(cleaned), ", "))
+
+    return cleaned
 end
 
 # Helper function for linear interpolation

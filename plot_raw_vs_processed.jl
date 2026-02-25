@@ -13,7 +13,7 @@ using Plots
 include("src/read_data,jl")
 
 # === Configuration ===
-sensor         = "SFC"
+sensor         = "LOWER"
 input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2025/converted"
 processed_base = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor"
 plot_dir       = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor/plots"
@@ -21,11 +21,11 @@ mkpath(plot_dir)
 
 # Variables to plot: (raw_column, processed_column, label)
 plot_vars = [
-    (:Ux,      :Ux,  "Ux [m/s]"),
-    (:Uy,      :Uy,  "Uy [m/s]"),
-    (:Uz,      :Uz,  "Uz [m/s]"),
-    (:Ts,      :Ts,  "Ts [°C]"),
-    (:LI_H2Om, :H2O, "H2O [mmol/m³]"),
+    (:Ux_16m,      :Ux,  "Ux [m/s]"),
+    (:Uy_16m,      :Uy,  "Uy [m/s]"),
+    (:Uz_16m,      :Uz,  "Uz [m/s]"),
+    (:Ts_16m,      :Ts,  "Ts [°C]"),
+    (:LI_H2Om_16m, :H2O, "H2O [mmol/m³]"),
 ]
 
 # CSV options for reading processed .dat files
