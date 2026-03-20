@@ -42,7 +42,7 @@ function build_hf_dimarray(fast_data::DataFrame, meta)
 
     # Peddy variable names: apply COLUMN_RENAME to the base (unsuffixed) names
     hf_vars = [get(COLUMN_RENAME, c, c) for c in base_cols]
-    hf_matrix = hcat([Float64.(fast_data[!, c]) for c in raw_cols]...)
+    hf_matrix = hcat([map(x -> ismissing(x) ? NaN : Float64(x), fast_data[!, c]) for c in raw_cols]...)
 
     return DimArray(hf_matrix, (Ti(fast_data.TIMESTAMP), Var(hf_vars)))
 end

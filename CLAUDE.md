@@ -9,15 +9,22 @@ Eddy covariance (EC) data processing pipeline for snow research stations, built 
 ## Architecture
 
 ```
-EC_processing.ipynb          ← Main pipeline notebook (runs end-to-end)
-src/read_data,jl             ← Data readers: read_fast_data(), read_slow_data(), clean_slowdata()
-save_data.jl                 ← TOA5-format writer: save_slow_data()
-Peddy.jl/                    ← Local dev copy of the EC processing library (separate repo)
+EC_processing.ipynb              ← Main pipeline notebook (runs end-to-end)
+src/read_data,jl                 ← Data readers: read_fast_data(), read_slow_data(), clean_slowdata()
+src/save_data.jl                 ← TOA5-format writer: save_slow_data()
+src/process_sensor.jl            ← Core pipeline engine: process_sensor()
+scripts/run_SFC.jl               ← Per-station entry points
+scripts/run_LOWER.jl
+scripts/run_UPPER.jl
+scripts/run_BOTTOM.jl
+scripts/run_mrd.jl               ← MRD post-processor
+scripts/plot_raw_vs_processed.jl ← Visualization
+Peddy.jl/                        ← Local dev copy of the EC processing library (separate repo)
 ```
 
 **Data flow:** Raw TOA5 `.dat` files → `read_fast_data()`/`read_slow_data()` → DataFrame → convert to DimArray → `EddyPipeline.process!()` → output (ICSV/NetCDF/Memory)
 
-**Note:** The file `src/read_data,jl` has a comma in its name, not a period. Include it with `include("src/read_data,jl")`.
+**Note:** The file `src/read_data,jl` has a comma in its name, not a period. Include it with `include("../src/read_data,jl")` from scripts, or `include("src/read_data,jl")` from the project root.
 
 ## Key Commands
 

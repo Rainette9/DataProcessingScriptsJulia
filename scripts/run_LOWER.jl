@@ -1,4 +1,4 @@
-#!/usr/bin/env julia --project=.
+#!/usr/bin/env julia --project=@.
 # Run the EC processing pipeline for the LOWER sensor.
 
 using Peddy
@@ -8,13 +8,14 @@ using DataFrames
 using Statistics
 using CSV
 
-include("process_sensor.jl")
-include("src/read_data,jl")
-include("save_data.jl")
+include("../src/process_sensor.jl")
+include("../src/read_data,jl")
+include("../src/save_data.jl")
 
 # === Configuration ===
 input_base       = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transfer"
 processed_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF"
+slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_slow/LOWER"
 year             = 2026
 
 # === Load slow data ===
@@ -26,7 +27,6 @@ slow_data = clean_tower_slowdata(slow_raw, "_16m")
 println("  $(nrow(slow_data)) slow records loaded")
 
 # === Save slow data ===
-slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_slow/LOWER"
 println("Saving slow data (OneMin)...")
 save_slow_data(slow_data, slow_output, "LOWER")
 

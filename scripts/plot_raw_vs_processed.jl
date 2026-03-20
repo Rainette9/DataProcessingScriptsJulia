@@ -1,4 +1,4 @@
-#!/usr/bin/env julia --project=.
+#!/usr/bin/env julia --project=@.
 """
 plot_raw_vs_processed.jl
 
@@ -10,13 +10,14 @@ using Peddy, Dates, Statistics, CSV, DataFrames
 using DimensionalData
 using Plots
 
-include("src/read_data,jl")
+include("../src/read_data,jl")
 
 # === Configuration ===
 sensor         = "LOWER"
-input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2025/converted"
-processed_base = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor"
-plot_dir       = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor/plots"
+input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transfer/"
+# input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2025/converted/" 
+processed_base = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor"
+plot_dir       = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor/plots"
 mkpath(plot_dir)
 
 # Variables to plot: (raw_column, processed_column, label)
@@ -27,6 +28,14 @@ plot_vars = [
     (:Ts_16m,      :Ts,  "Ts [°C]"),
     (:LI_H2Om_16m, :H2O, "H2O [mmol/m³]"),
 ]
+
+# plot_vars = [
+#     (:Ux_5m,      :Ux,  "Ux [m/s]"),
+#     (:Uy_5m,      :Uy,  "Uy [m/s]"),
+#     (:Uz_5m,      :Uz,  "Uz [m/s]"),
+#     (:Ts_5m,      :Ts,  "Ts [°C]"),
+#     (:LI_H2Om_5m, :H2O, "H2O [mmol/m³]"),
+# ]
 
 # CSV options for reading processed .dat files
 fo = Peddy.FileOptions(

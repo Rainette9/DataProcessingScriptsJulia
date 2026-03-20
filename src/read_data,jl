@@ -114,16 +114,18 @@ function read_fast_data(;
                 end
             end
 
-            # Fallback: if we never found a start, dates might be before all files
+            # If first_idx was never set, all files in this directory predate
+            # target_start — nothing to read here, skip to the next directory.
             if isnothing(first_idx)
-                first_idx = 1
+                println("  Pre-scan: all files predate $target_start — skipping directory")
+                fast_files = String[]
+            else
+                if isnothing(last_idx)
+                    last_idx = length(fast_files)
+                end
+                fast_files = fast_files[first_idx:last_idx]
+                println("  Pre-scan: reading files $(first_idx) to $(last_idx) of $(length(filter(f -> _is_fast_file(f), files))) (dates $target_start to $target_end)")
             end
-            if isnothing(last_idx)
-                last_idx = length(fast_files)
-            end
-
-            fast_files = fast_files[first_idx:last_idx]
-            println("  Pre-scan: reading files $(first_idx) to $(last_idx) of $(length(filter(f -> _is_fast_file(f), files))) (dates $target_start to $target_end)")
         end
 
         # Read the selected files
@@ -359,12 +361,57 @@ end
 
 # Helper function to read TOA5 format file
 function _read_toa5_file(file_path::String)
-    # Read CSV file (TOA5: row 1=metadata, row 2=headers, row 3=units, row 4=processing, row 5+=data)
-    df = CSV.read(file_path, DataFrame;
+    # Pre-process: strip embedded re-header blocks BEFORE CSV parsing.
+    # Datalogger restarts insert a 4-row TOA5 header block mid-file. These blocks
+    # start with the environment row ("TOA5",...) and cause CSV.jl to crash on
+    # invalidly-quoted fields. We skip exactly 4 rows whenever we see "TOA5",
+    # keeping all other rows (quoted or unquoted data rows) intact.
+    raw_lines = readlines(file_path)
+    header_block = raw_lines[1:min(4, length(raw_lines))]
+    data_lines   = String[]
+    i = 5
+    while i <= length(raw_lines)
+        line = raw_lines[i]
+        if startswith(line, "\"TOA5\"")   # re-header environment row → skip 4 rows
+            i += 4
+        else
+            push!(data_lines, line)
+            i += 1
+        end
+    end
+    cleaned_io   = IOBuffer(join([header_block; data_lines], '\n'))
+
+    # Read CSV file (TOA5: row 1=metadata, row 2=headers, row 3=units, row 4=processing, row 5+=data).
+    # quoted=false: treat '"' as a regular character so that any stray unescaped quotes
+    # in data values (or residual re-header fragments) can never crash the parser.
+    # Column names in the TOA5 header are wrapped in '"'; strip them after reading.
+    df = CSV.read(cleaned_io, DataFrame;
                  header=2,
                  skipto=5,
+                 quoted=false,
                  silencewarnings=true,
                  stringtype=String)
+
+    # Strip surrounding '"' from column names (artifact of quoted=false on a quoted header)
+    rename!(df, Dict(c => strip(c, '"') for c in names(df) if startswith(c, '"')))
+
+    # Safety net: drop any remaining non-date rows in TIMESTAMP.
+    # With quoted=false some timestamps may be wrapped in '"'; the regex matches
+    # either form: ^"?YYYY-MM- or ^YYYY-MM-
+    filter!(row -> occursin(r"[0-9]{4}-[0-9]{2}-", row.TIMESTAMP), df)
+
+    # Re-cast columns that became String due to embedded re-headers.
+    # After filtering, any remaining String column that holds numeric text
+    # should be converted back to Float64 (non-parseable values → missing).
+    for col in names(df)
+        col == "TIMESTAMP" && continue
+        if nonmissingtype(eltype(df[!, col])) == String
+            parsed = [ismissing(x) ? missing : something(tryparse(Float64, x), missing) for x in df[!, col]]
+            if any(!ismissing, parsed)
+                df[!, col] = parsed
+            end
+        end
+    end
 
     # Parse timestamp (handles quoted strings and hour=24 notation)
     df.TIMESTAMP = _fix_timestamp.(df.TIMESTAMP)
@@ -410,82 +457,39 @@ end
 # Helper function to merge wind data for SFC sensor
 function _merge_wind_data(main_df::DataFrame, file_name::String, root::String, all_files::Vector{String})
     wind_units = Dict{String, String}()
-    
-    # Try to extract file number from filename
-    file_match = match(r"_(\d+)\.dat", file_name)
-    if isnothing(file_match)
-        file_match = match(r"_(\d+)", file_name)
+
+    # All wind files in this directory
+    wind_files = filter(f -> occursin(r"wind"i, f) && (endswith(f, ".dat") || endswith(f, ".csv")), all_files)
+    isempty(wind_files) && return main_df, wind_units
+
+    # Try date-based match: extract YYYY_MM_DD from the OneMin filename and find
+    # a wind file containing the same date string.
+    date_match = match(r"_(\d{4}_\d{2}_\d{2})_", file_name)
+    wind_file = if !isnothing(date_match)
+        date_str = date_match.captures[1]
+        matched = filter(f -> occursin(date_str, f), wind_files)
+        isempty(matched) ? nothing : first(matched)
+    else
+        nothing
     end
-    
-    if !isnothing(file_match)
-        number = file_match.captures[1]
-        
-        # Look for wind file with same number
-        wind_pattern = "wind_$number"
-        wind_files = filter(f -> occursin(wind_pattern, f) && (endswith(f, ".dat") || endswith(f, ".csv")), all_files)
-        
-        if !isempty(wind_files)
-            wind_file = first(wind_files)
-            wind_file_path = joinpath(root, wind_file)
-            println("    Found matching wind file: $wind_file")
-            
-            try
-                # Read wind data
-                wind_df = CSV.read(wind_file_path, DataFrame; 
-                                  header=2,
-                                  skipto=5,
-                                  silencewarnings=true,
-                                  stringtype=String)
-                
-                # Parse timestamp
-                wind_df.TIMESTAMP = _fix_timestamp.(wind_df.TIMESTAMP)
-                
-                # Read wind units
-                wind_units = _read_units(wind_file_path)
-                
-                # Set TIMESTAMP as index for join
-                main_df_indexed = groupby(main_df, :TIMESTAMP)
-                wind_df_indexed = groupby(wind_df, :TIMESTAMP)
-                
-                # Join dataframes
-                merged_df = leftjoin(main_df, wind_df, on=:TIMESTAMP, makeunique=true)
-                
-                return merged_df, wind_units
-            catch e
-                @warn "Error merging wind data from $wind_file" exception=(e, catch_backtrace())
-                return main_df, wind_units
-            end
-        end
+
+    # Fall back to the wind file whose date is closest to (but not after) the OneMin file date
+    if isnothing(wind_file)
+        wind_file = first(sort(wind_files))  # earliest available
     end
-    
-    # If no specific wind file found, try generic wind file
-    wind_files = filter(f -> occursin("wind", lowercase(f)) && (endswith(f, ".dat") || endswith(f, ".csv")), all_files)
-    
-    if !isempty(wind_files)
-        wind_file = first(wind_files)
-        wind_file_path = joinpath(root, wind_file)
-        println("    Found wind file: $wind_file")
-        
-        try
-            # Read and merge wind data
-            wind_df = CSV.read(wind_file_path, DataFrame; 
-                              header=2,
-                              skipto=5,
-                              silencewarnings=true,
-                              stringtype=String)
-            
-            wind_df.TIMESTAMP = DateTime.(wind_df.TIMESTAMP, dateformat"yyyy-mm-dd HH:MM:SS.s")
-            wind_units = _read_units(wind_file_path)
-            
-            merged_df = leftjoin(main_df, wind_df, on=:TIMESTAMP, makeunique=true)
-            return merged_df, wind_units
-        catch e
-            @warn "Error merging wind data from $wind_file" exception=(e, catch_backtrace())
-            return main_df, wind_units
-        end
+
+    wind_file_path = joinpath(root, wind_file)
+    println("    Found wind file: $wind_file")
+
+    try
+        wind_df    = _read_toa5_file(wind_file_path)
+        wind_units = _read_units(wind_file_path)
+        merged_df  = leftjoin(main_df, wind_df, on=:TIMESTAMP, makeunique=true)
+        return merged_df, wind_units
+    catch e
+        @warn "Error merging wind data from $wind_file" exception=(e, catch_backtrace())
+        return main_df, wind_units
     end
-    
-    return main_df, wind_units
 end
 
 # Helper function to process and combine slow dataframes with resampling
@@ -762,7 +766,7 @@ function clean_slowdata(slowdata::DataFrame)
     if "WS_FC4" in names(slowdata_cleaned)
         slowdata_cleaned[!, "WS_FC4"] = slowdata_cleaned[!, "WS_FC4"] ./ 3.6
     end
-    
+
     # Apply bounds for shortwave radiation (SW: -20 to 1300 W/m²)
     for var in ["SWdown1", "SWdown2", "SWup1", "SWup2"]
         if var in names(slowdata_cleaned)
@@ -876,6 +880,13 @@ function clean_tower_slowdata(slowdata::DataFrame, suffix::String)
             missing,
             cleaned[!, temp_col]
         )
+    end
+
+    # Convert RH_16m_Avg and RH_26m_Avg from fraction (0–1) to percentage (0–100)
+    for rh_col in ["RH_16m_Avg", "RH_26m_Avg"]
+        if rh_col in names(cleaned)
+            cleaned[!, rh_col] = cleaned[!, rh_col] .* 100
+        end
     end
 
     # Convert FluxWind columns from km/h to m/s (only LOWER has these)

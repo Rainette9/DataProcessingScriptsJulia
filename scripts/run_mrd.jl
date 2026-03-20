@@ -1,4 +1,4 @@
-#!/usr/bin/env julia --project=.
+#!/usr/bin/env julia --project=@.
 """
 run_mrd.jl
 
@@ -17,9 +17,9 @@ using LaTeXStrings
 using Glob
 
 # === Configuration ===
-sensor       = "LOWER"
-input_base   = "/home/engbers/Documents/PhD/EC_data_convert/2025/processed_HF/$sensor"
-output_path  = "/home/engbers/Documents/PhD/EC_data_convert/2025/MRD/$sensor"
+sensor       = "BOTTOM"
+input_base   = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor"
+output_path  = "/home/engbers/Documents/PhD/EC_data_convert/2026/MRD/$sensor"
 mkpath(output_path)
 
 fo = Peddy.FileOptions(
