@@ -17,6 +17,7 @@ input_base       = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transf
 processed_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF"
 slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_slow/SFC"
 
+biomet_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/biomet/SFC"
 year             = 2026
 
 # === Load and clean slow data ===
@@ -30,6 +31,10 @@ println("  $(nrow(slow_data)) slow records loaded")
 # === Save slow data (including wind columns) ===
 println("Saving slow data (OneMin) with wind columns...")
 save_slow_data(slow_data, slow_output, "SFC")
+
+# === Save EddyPro biomet files (monthly CSV) ===
+println("Saving biomet files for EddyPro...")
+save_biomet_data(slow_data, biomet_output, "SFC")
 
 # === Process ===
 # Pass --restart to reprocess all dates; default resumes from where it left off.

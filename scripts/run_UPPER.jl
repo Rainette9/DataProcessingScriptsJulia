@@ -16,6 +16,7 @@ include("../src/save_data.jl")
 input_base       = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transfer"
 processed_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF"
 slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_slow/UPPER"
+biomet_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/biomet/UPPER"
 year             = 2026
 
 # === Load slow data ===
@@ -29,6 +30,10 @@ println("  $(nrow(slow_data)) slow records loaded")
 # === Save slow data ===
 println("Saving slow data (OneMin)...")
 save_slow_data(slow_data, slow_output, "UPPER")
+
+# === Save EddyPro biomet files (monthly CSV) ===
+println("Saving biomet files for EddyPro...")
+save_biomet_data(slow_data, biomet_output, "UPPER")
 
 # === Process ===
 # Pass --restart to reprocess all dates; default resumes from where it left off.

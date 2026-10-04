@@ -10,15 +10,22 @@ const COLUMN_RENAME = Dict(
 
 """
 Per-sensor configuration: measurement height, slow-data column names,
-whether a LI-7500 gas analyzer is present, and the column-name suffix
-used in the raw fast-data files (empty string for SFC).
+whether a LI-7500 gas analyzer is present, the column-name suffix
+used in the raw fast-data files (empty string for SFC), and the offset
+added to the raw LI-7500 pressure (the SFC logger stores kPa - 80).
 """
 const SENSORS = Dict(
-    "SFC"    => (height=2,  ta_col=:TA,           rh_col=:RH,          has_licor=true,  suffix=""),
-    "LOWER"  => (height=16, ta_col=:Temp_16m_Avg, rh_col=:RH_16m_Avg, has_licor=true,  suffix="_16m"),
-    "UPPER"  => (height=26, ta_col=:Temp_26m_Avg, rh_col=:RH_26m_Avg, has_licor=true,  suffix="_26m"),
-    "BOTTOM" => (height=5,  ta_col=:Temp_5m_Avg,  rh_col=:RH_5m_Avg,  has_licor=false, suffix="_5m"),
+    "SFC"    => (height=2,  ta_col=:TA,           rh_col=:RH,          has_licor=true,  suffix="",     pres_offset=80.0),
+    "LOWER"  => (height=16, ta_col=:Temp_16m_Avg, rh_col=:RH_16m_Avg, has_licor=true,  suffix="_16m", pres_offset=0.0),
+    "UPPER"  => (height=26, ta_col=:Temp_26m_Avg, rh_col=:RH_26m_Avg, has_licor=true,  suffix="_26m", pres_offset=0.0),
+    "BOTTOM" => (height=5,  ta_col=:Temp_5m_Avg,  rh_col=:RH_5m_Avg,  has_licor=false, suffix="_5m",  pres_offset=0.0),
 )
+
+"""Physically plausible H2O molar density (mmol m⁻³) after the gas analyzer correction."""
+const H2O_BOUNDS = (0.0, 400.0)
+
+"""Reference (slow data) gaps up to this many minutes are interpolated for the H2O correction."""
+const MAX_REF_GAP_MIN = 10
 
 # ── Helper functions ─────────────────────────────────────────────────────────
 
@@ -44,14 +51,49 @@ function build_hf_dimarray(fast_data::DataFrame, meta)
     hf_vars = [get(COLUMN_RENAME, c, c) for c in base_cols]
     hf_matrix = hcat([map(x -> ismissing(x) ? NaN : Float64(x), fast_data[!, c]) for c in raw_cols]...)
 
+    # Absolute pressure in kPa (needed by the H2O correction)
+    ip = findfirst(==(:P), hf_vars)
+    if ip !== nothing && meta.pres_offset != 0
+        hf_matrix[:, ip] .+= meta.pres_offset
+    end
+
     return DimArray(hf_matrix, (Ti(fast_data.TIMESTAMP), Var(hf_vars)))
+end
+
+"""Linear interpolation over NaN runs of at most `maxgap` points; longer runs stay NaN."""
+function fill_short_gaps!(x::Vector{Float64}, maxgap::Int)
+    n = length(x)
+    i = 1
+    while i <= n
+        if isnan(x[i])
+            j = i
+            while j < n && isnan(x[j + 1])
+                j += 1
+            end
+            if i > 1 && j < n && (j - i + 1) <= maxgap
+                for k in i:j
+                    w = (k - i + 1) / (j - i + 2)
+                    x[k] = (1 - w) * x[i - 1] + w * x[j + 1]
+                end
+            end
+            i = j + 1
+        else
+            i += 1
+        end
+    end
+    return x
 end
 
 """
     build_lf_dimarray(slow_data::DataFrame, meta, date::Date) -> Union{DimArray, Nothing}
 
-Filter slow data to a single day and build a low-frequency DimArray with TA and
-RH columns. RH is divided by 100 to convert from percentage to fraction.
+Build a low-frequency DimArray with TA and RH on a regular 1-min grid from
+`date - 1h` to `date + 1d + 1h`. Minutes without slow data are NaN, so the H2O
+correction gives NaN there instead of using a reference minute hours away
+(Peddy maps each fast sample to the nearest slow timestamp without a distance
+limit). Gaps up to `MAX_REF_GAP_MIN` minutes are interpolated. Logger zeros
+(TA and RH both exactly 0) are treated as missing. RH is divided by 100 to
+convert from percentage to fraction.
 Returns `nothing` if no data is available for the given day.
 """
 function build_lf_dimarray(slow_data::DataFrame, meta, date::Date)
@@ -62,21 +104,41 @@ function build_lf_dimarray(slow_data::DataFrame, meta, date::Date)
         return nothing
     end
 
-    day_start = DateTime(date)
-    day_end   = DateTime(date + Day(1))
-    day_slow  = filter(r -> r.TIMESTAMP >= day_start && r.TIMESTAMP < day_end, slow_data)
+    grid = collect(DateTime(date) - Hour(1):Minute(1):DateTime(date + Day(1)) + Hour(1))
+    win  = filter(r -> grid[1] <= r.TIMESTAMP <= grid[end], slow_data)
 
-    if nrow(day_slow) == 0
+    lookup = Dict{DateTime, Tuple{Float64, Float64}}()
+    for r in eachrow(win)
+        ta = Float64(coalesce(r[ta_name], NaN))
+        rh = Float64(coalesce(r[rh_name], NaN))
+        if ta == 0 && rh == 0
+            continue  # logger zeros
+        end
+        lookup[floor(r.TIMESTAMP, Minute)] = (ta, rh / 100)  # fraction 0–1
+    end
+
+    ta = [get(lookup, t, (NaN, NaN))[1] for t in grid]
+    rh = [get(lookup, t, (NaN, NaN))[2] for t in grid]
+
+    day = DateTime(date) .<= grid .< DateTime(date + Day(1))
+    if !any(.!isnan.(rh[day]) .& .!isnan.(ta[day]))
         return nothing
     end
 
-    return DimArray(
-        hcat(
-            Float64.(coalesce.(day_slow[!, ta_name], NaN)),
-            Float64.(coalesce.(day_slow[!, rh_name], NaN)) ./ 100  # fraction 0–1
-        ),
-        (Ti(day_slow.TIMESTAMP), Var([:TA, :RH]))
-    )
+    fill_short_gaps!(ta, MAX_REF_GAP_MIN)
+    fill_short_gaps!(rh, MAX_REF_GAP_MIN)
+
+    return DimArray(hcat(ta, rh), (Ti(grid), Var([:TA, :RH])))
+end
+
+"""Set H2O outside `H2O_BOUNDS` to NaN (in place). Returns the number of values removed."""
+function apply_h2o_bounds!(hf_result::DimArray)
+    ih = findfirst(==(:H2O), collect(dims(hf_result, Var)))
+    ih === nothing && return 0
+    col = @view parent(hf_result)[:, ih]
+    bad = .!isnan.(col) .& ((col .< H2O_BOUNDS[1]) .| (col .> H2O_BOUNDS[2]))
+    col[bad] .= NaN
+    return sum(bad)
 end
 
 """
@@ -108,14 +170,14 @@ end
 
 """
     make_pipeline(meta, cal_coeffs, has_slow; spike_threshold, window_minutes,
-                  block_duration_min, max_gap_minutes, dt_ms, logger)
+                  block_duration_min, max_gap_minutes, max_gap_samples, dt_ms, logger)
 
 Construct the Peddy sensor, variable groups, and EddyPipeline.
 Returns `(pipeline, output)`.
 """
 function make_pipeline(meta, cal_coeffs, has_slow;
                        spike_threshold, window_minutes, block_duration_min,
-                       max_gap_minutes, dt_ms, logger)
+                       max_gap_minutes, max_gap_samples, dt_ms, logger)
     peddy_sensor = meta.has_licor ? LICOR(calibration_coefficients=cal_coeffs) : CSAT3()
 
     has_gas_analyzer = meta.has_licor && cal_coeffs !== nothing && has_slow
@@ -148,7 +210,7 @@ function make_pipeline(meta, cal_coeffs, has_slow;
             variable_groups = var_groups,
         ),
         make_continuous = MakeContinuous(step_size_ms=dt_ms, max_gap_minutes=max_gap_minutes),
-        gap_filling     = GeneralInterpolation(),
+        gap_filling     = GeneralInterpolation(max_gap_size=max_gap_samples),
         double_rotation = WindDoubleRotation(block_duration_minutes=block_duration_min),
         output          = output,
         logger          = logger,
@@ -185,6 +247,7 @@ overwritten).
 | `:window_minutes`        | Float64 | 5.0                                  |
 | `:block_duration_minutes`| Float64 | 30.0                                 |
 | `:max_gap_minutes`       | Float64 | 5.0                                  |
+| `:max_gap_samples`       | Int     | 5 (longest gap filled by interpolation, in samples) |
 """
 function process_sensor(;
     input_base::String,
@@ -209,6 +272,7 @@ function process_sensor(;
     window_minutes     = get(config, :window_minutes, 5.0)
     block_duration_min = get(config, :block_duration_minutes, 30.0)
     max_gap_minutes    = get(config, :max_gap_minutes, 5.0)
+    max_gap_samples    = get(config, :max_gap_samples, 5)
 
     sensor_type = meta.has_licor ? :licor : :csat3
 
@@ -269,6 +333,8 @@ function process_sensor(;
     log_metadata!(logger, "sensor", sensor)
     log_metadata!(logger, "sensor_type", string(sensor_type))
     log_metadata!(logger, "year", string(year))
+    log_metadata!(logger, "interpolation_max_gap_samples", string(max_gap_samples))
+    log_metadata!(logger, "pressure_offset_kPa", string(meta.pres_offset))
 
     has_gas_analyzer = meta.has_licor && cal_coeffs !== nothing && has_slow
     log_metadata!(logger, "gas_analyzer", has_gas_analyzer ? "H2OCalibration" : "disabled")
@@ -302,6 +368,15 @@ function process_sensor(;
             unique!(fast_data, :TIMESTAMP)
             sort!(fast_data, :TIMESTAMP)
 
+            # read_fast_data returns whole raw files, which can span several days.
+            # Keep only this date, so each day writes only its own hours and does
+            # not overwrite the output of neighbouring days.
+            filter!(r -> Date(r.TIMESTAMP) == date, fast_data)
+            if nrow(fast_data) == 0
+                @warn "No fast data for $date after trimming to the day — skipping"
+                continue
+            end
+
             # Detect sampling rate
             dt_ms = round(Int, median([Dates.value(d) for d in diff(fast_data.TIMESTAMP)]))
             println("  Records: $(nrow(fast_data))  Sampling: $(dt_ms) ms ($(round(1000.0/dt_ms, digits=1)) Hz)")
@@ -318,12 +393,14 @@ function process_sensor(;
             day_has_slow = low_frequency_data !== nothing
             pipeline, output = make_pipeline(meta, cal_coeffs, day_has_slow;
                 spike_threshold, window_minutes, block_duration_min,
-                max_gap_minutes, dt_ms, logger)
+                max_gap_minutes, max_gap_samples, dt_ms, logger)
 
             process!(pipeline, high_frequency_data, low_frequency_data)
 
             # Extract results and write hourly dat files
             hf_result, _ = Peddy.get_results(output)
+            n_bad_h2o = apply_h2o_bounds!(hf_result)
+            n_bad_h2o > 0 && println("  Removed $n_bad_h2o H2O values outside $(H2O_BOUNDS) mmol m-3")
             n_written = _write_hourly_files(hf_result, fast_out_base, sensor, dt_ms)
             total_files += n_written
             println("  Wrote $n_written hourly dat files")
