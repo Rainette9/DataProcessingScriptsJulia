@@ -11,14 +11,18 @@ const COLUMN_RENAME = Dict(
 """
 Per-sensor configuration: measurement height, slow-data column names,
 whether a LI-7500 gas analyzer is present, the column-name suffix
-used in the raw fast-data files (empty string for SFC), and the offset
-added to the raw LI-7500 pressure (the SFC logger stores kPa - 80).
+used in the raw fast-data files (empty string for SFC), the offset
+added to the raw LI-7500 pressure (the SFC logger stores kPa - 80), and the
+number of samples on either side of a CSAT warning that are also removed.
+The margin is 0 at SFC: there a warning marks a single sample blocked by a snow
+particle and its neighbours are as good as any other sample. On the towers the
+samples next to a warning are clearly disturbed (sonic faults), so they get 2.
 """
 const SENSORS = Dict(
-    "SFC"    => (height=2,  ta_col=:TA,           rh_col=:RH,          has_licor=true,  suffix="",     pres_offset=80.0),
-    "LOWER"  => (height=16, ta_col=:Temp_16m_Avg, rh_col=:RH_16m_Avg, has_licor=true,  suffix="_16m", pres_offset=0.0),
-    "UPPER"  => (height=26, ta_col=:Temp_26m_Avg, rh_col=:RH_26m_Avg, has_licor=true,  suffix="_26m", pres_offset=0.0),
-    "BOTTOM" => (height=5,  ta_col=:Temp_5m_Avg,  rh_col=:RH_5m_Avg,  has_licor=false, suffix="_5m",  pres_offset=0.0),
+    "SFC"    => (height=2,  ta_col=:TA,           rh_col=:RH,          has_licor=true,  suffix="",     pres_offset=80.0, diag_margin=0),
+    "LOWER"  => (height=16, ta_col=:Temp_16m_Avg, rh_col=:RH_16m_Avg, has_licor=true,  suffix="_16m", pres_offset=0.0,  diag_margin=2),
+    "UPPER"  => (height=26, ta_col=:Temp_26m_Avg, rh_col=:RH_26m_Avg, has_licor=true,  suffix="_26m", pres_offset=0.0,  diag_margin=2),
+    "BOTTOM" => (height=5,  ta_col=:Temp_5m_Avg,  rh_col=:RH_5m_Avg,  has_licor=false, suffix="_5m",  pres_offset=0.0,  diag_margin=2),
 )
 
 """Physically plausible H2O molar density (mmol m⁻³) after the gas analyzer correction."""
@@ -49,7 +53,10 @@ function build_hf_dimarray(fast_data::DataFrame, meta)
 
     # Peddy variable names: apply COLUMN_RENAME to the base (unsuffixed) names
     hf_vars = [get(COLUMN_RENAME, c, c) for c in base_cols]
-    hf_matrix = hcat([map(x -> ismissing(x) ? NaN : Float64(x), fast_data[!, c]) for c in raw_cols]...)
+    # Raw files where a column is only "NAN" are read as String columns
+    to_float(x) = ismissing(x) ? NaN :
+                  x isa AbstractString ? something(tryparse(Float64, x), NaN) : Float64(x)
+    hf_matrix = hcat([map(to_float, fast_data[!, c]) for c in raw_cols]...)
 
     # Absolute pressure in kPa (needed by the H2O correction)
     ip = findfirst(==(:P), hf_vars)
@@ -170,15 +177,19 @@ end
 
 """
     make_pipeline(meta, cal_coeffs, has_slow; spike_threshold, window_minutes,
-                  block_duration_min, max_gap_minutes, max_gap_samples, dt_ms, logger)
+                  block_duration_min, max_gap_minutes, max_gap_samples, diag_margin,
+                  ts_max_deviation, dt_ms, logger)
 
 Construct the Peddy sensor, variable groups, and EddyPipeline.
 Returns `(pipeline, output)`.
 """
 function make_pipeline(meta, cal_coeffs, has_slow;
                        spike_threshold, window_minutes, block_duration_min,
-                       max_gap_minutes, max_gap_samples, dt_ms, logger)
-    peddy_sensor = meta.has_licor ? LICOR(calibration_coefficients=cal_coeffs) : CSAT3()
+                       max_gap_minutes, max_gap_samples, diag_margin, ts_max_deviation,
+                       dt_ms, logger)
+    peddy_sensor = meta.has_licor ?
+        LICOR(calibration_coefficients=cal_coeffs, diag_margin=diag_margin) :
+        CSAT3(diag_margin=diag_margin)
 
     has_gas_analyzer = meta.has_licor && cal_coeffs !== nothing && has_slow
 
@@ -208,6 +219,8 @@ function make_pipeline(meta, cal_coeffs, has_slow;
         despiking       = SimpleSigmundDespiking(
             window_minutes  = window_minutes,
             variable_groups = var_groups,
+            max_ts_deviation = ts_max_deviation,
+            couple_sonic     = true,  # a despiked Ts or wind value removes the whole sonic sample
         ),
         make_continuous = MakeContinuous(step_size_ms=dt_ms, max_gap_minutes=max_gap_minutes),
         gap_filling     = GeneralInterpolation(max_gap_size=max_gap_samples),
@@ -248,6 +261,8 @@ overwritten).
 | `:block_duration_minutes`| Float64 | 30.0                                 |
 | `:max_gap_minutes`       | Float64 | 5.0                                  |
 | `:max_gap_samples`       | Int     | 5 (longest gap filled by interpolation, in samples) |
+| `:diag_margin`           | Int     | per sensor from `SENSORS` (SFC 0, towers 2; samples either side of a CSAT warning also set to NaN) |
+| `:ts_max_deviation`      | Float64 | 10.0 (K; |Ts - 5-min rolling median| above this removes the sonic sample) |
 """
 function process_sensor(;
     input_base::String,
@@ -258,6 +273,7 @@ function process_sensor(;
     resume::Bool = true,
     config::Dict = Dict(),
     slow_data::DataFrame = DataFrame(),
+    log_tag::String = "",
     location = LocationMetadata(
         latitude          = -71.949608,
         longitude         = 23.0,
@@ -273,6 +289,8 @@ function process_sensor(;
     block_duration_min = get(config, :block_duration_minutes, 30.0)
     max_gap_minutes    = get(config, :max_gap_minutes, 5.0)
     max_gap_samples    = get(config, :max_gap_samples, 5)
+    diag_margin        = get(config, :diag_margin, meta.diag_margin)
+    ts_max_deviation   = get(config, :ts_max_deviation, 10.0)
 
     sensor_type = meta.has_licor ? :licor : :csat3
 
@@ -334,6 +352,9 @@ function process_sensor(;
     log_metadata!(logger, "sensor_type", string(sensor_type))
     log_metadata!(logger, "year", string(year))
     log_metadata!(logger, "interpolation_max_gap_samples", string(max_gap_samples))
+    log_metadata!(logger, "sonic_diag_margin_samples", string(diag_margin))
+    log_metadata!(logger, "ts_max_deviation_K", string(ts_max_deviation))
+    log_metadata!(logger, "despiking_couple_sonic", "true")
     log_metadata!(logger, "pressure_offset_kPa", string(meta.pres_offset))
 
     has_gas_analyzer = meta.has_licor && cal_coeffs !== nothing && has_slow
@@ -393,7 +414,8 @@ function process_sensor(;
             day_has_slow = low_frequency_data !== nothing
             pipeline, output = make_pipeline(meta, cal_coeffs, day_has_slow;
                 spike_threshold, window_minutes, block_duration_min,
-                max_gap_minutes, max_gap_samples, dt_ms, logger)
+                max_gap_minutes, max_gap_samples, diag_margin, ts_max_deviation,
+                dt_ms, logger)
 
             process!(pipeline, high_frequency_data, low_frequency_data)
 
@@ -411,7 +433,7 @@ function process_sensor(;
                 current_month = month_str
                 month_dir = joinpath(fast_out_base, month_str)
                 mkpath(month_dir)
-                log_file = joinpath(month_dir, "$(sensor)_processing_log_$(month_str).csv")
+                log_file = joinpath(month_dir, "$(sensor)_processing_log_$(month_str)$(log_tag).csv")
                 write_processing_log(logger, log_file)
             else
                 write_processing_log(logger, log_file; append=true)

@@ -7,6 +7,9 @@
 #   --restart  reprocess all dates (existing hourly files are overwritten)
 #   --out      processed_HF output folder (default <ROOT>/<YEAR>/processed_HF), e.g. for tests
 #   --dates    only these dates
+#   --diag_margin, --ts_max_deviation  override the process_sensor defaults (margin per sensor: SFC 0, towers 2; 10 K)
+#   --logtag   suffix for the monthly processing log names (e.g. _patch), so a partial
+#              run does not overwrite the logs of a full run
 #
 # Only dates within YEAR are processed (2025/converted also holds January 2026).
 # Slow data are only used as the H2O reference; processed_slow and biomet files
@@ -76,4 +79,9 @@ process_sensor(
     dates            = dates,
     resume           = !("--restart" in ARGS),
     slow_data        = slow_data,
+    log_tag          = something(opt("logtag"), ""),
+    config           = Dict{Symbol,Any}(
+        (opt("diag_margin") === nothing ? [] : [:diag_margin => parse(Int, opt("diag_margin"))])...,
+        (opt("ts_max_deviation") === nothing ? [] : [:ts_max_deviation => parse(Float64, opt("ts_max_deviation"))])...,
+    ),
 )
