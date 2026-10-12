@@ -1,12 +1,16 @@
 #!/usr/bin/env julia --project=@.
 # Run the Peddy fast-data pipeline for one sensor and one year.
 #
-# Usage: julia --project=. scripts/run_sensor.jl SENSOR YEAR [--restart] [--out=DIR] [--dates=yyyy-mm-dd,...]
+# Usage: julia --project=. scripts/run_sensor.jl SENSOR YEAR [--restart] [--input=DIR] [--out=DIR]
+#                                                 [--dates=yyyy-mm-dd,...] [--months=yyyymm,...]
 #   SENSOR  SFC | LOWER | UPPER | BOTTOM
-#   YEAR    2025 (input 2025/converted) or 2026 (input 2026/data_transfer)
+#   YEAR    2025 (input <ROOT>/2025/converted) or 2026 (input <ROOT>/2026/data_transfer)
+#   ROOT    environment variable EC_ROOT, default /home/engbers/Documents/PhD/EC_data_convert
 #   --restart  reprocess all dates (existing hourly files are overwritten)
+#   --input    raw data folder, overrides the default for YEAR
 #   --out      processed_HF output folder (default <ROOT>/<YEAR>/processed_HF), e.g. for tests
 #   --dates    only these dates
+#   --months   only these months (all calendar days; days without raw data are skipped)
 #   --diag_margin, --ts_max_deviation  override the process_sensor defaults (margin per sensor: SFC 0, towers 2; 10 K)
 #   --logtag   suffix for the monthly processing log names (e.g. _patch), so a partial
 #              run does not overwrite the logs of a full run
@@ -28,7 +32,7 @@ include("../src/process_sensor.jl")
 include("../src/read_data,jl")
 include("../src/save_data.jl")
 
-const ROOT = "/home/engbers/Documents/PhD/EC_data_convert"
+const ROOT = get(ENV, "EC_ROOT", "/home/engbers/Documents/PhD/EC_data_convert")
 const INPUT = Dict(2025 => "$ROOT/2025/converted", 2026 => "$ROOT/2026/data_transfer")
 
 opt(name) = (i = findfirst(a -> startswith(a, "--$name="), ARGS); i === nothing ? nothing : String(split(ARGS[i], "=", limit=2)[2]))
@@ -36,7 +40,8 @@ opt(name) = (i = findfirst(a -> startswith(a, "--$name="), ARGS); i === nothing 
 sensor = ARGS[1]
 year   = parse(Int, ARGS[2])
 haskey(SENSORS, sensor) || error("Unknown sensor $sensor")
-input_base       = INPUT[year]
+input_base       = something(opt("input"), get(INPUT, year, nothing), "")
+isdir(input_base) || error("No raw data folder for $year: pass --input=DIR")
 processed_output = something(opt("out"), "$ROOT/$year/processed_HF")
 
 # === Slow data (H2O reference) ===
@@ -67,6 +72,9 @@ println("  $(nrow(slow_data)) slow records")
 # === Dates ===
 dates = if opt("dates") !== nothing
     Date.(split(opt("dates"), ","))
+elseif opt("months") !== nothing
+    [d for m in split(opt("months"), ",")
+       for d in Date(parse(Int, m[1:4]), parse(Int, m[5:6]), 1):Day(1):lastdayofmonth(Date(parse(Int, m[1:4]), parse(Int, m[5:6]), 1))]
 else
     filter(d -> Dates.year(d) == year, list_available_dates(base_path=input_base, sensor=sensor))
 end
