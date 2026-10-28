@@ -317,3 +317,145 @@ function save_slow_data(data::DataFrame, output_base::String, sensor::String;
     println("Saved $(length(written_files)) daily files to $output_base")
     return written_files
 end
+
+
+# =============================================================================
+# EddyPro external biomet files
+# =============================================================================
+
+"""
+Column map for EddyPro biomet output.
+
+sensor => ordered vector of `(biomet_name, biomet_unit, source_column, transform)`.
+`source_column` may be a vector of candidate names; the first one present in the
+DataFrame with at least one non-missing value is used.
+Units are spelled the way EddyPro parses them ("C", "%", "kPa", "W+1M-2").
+Positional qualifier `_1_1_1` is required by EddyPro's native-header parser.
+
+Notes
+- SFC `LI_Pres_Avg` is logged as kPa - 80 (README_output.txt), hence the +80.
+- Tower RH columns are already in percent after `clean_tower_slowdata`.
+- BOTTOM has no pressure sensor and its RH probe was found stuck (2025), so only
+  TA and SW_IN are written; EddyPro falls back to sonic-derived RH and the
+  altitude-based pressure for that station.
+- In the .eddypro project the biomet columns are referenced by 1-based index
+  counting the two timestamp columns: TA=3, RH=4, PA=5, SW_IN=6, LW_IN=7
+  (for BOTTOM: TA=3, SW_IN=4).
+"""
+const BIOMET_COLUMN_MAP = Dict(
+    "SFC" => [
+        ("TA_1_1_1",    "C",      "TA",          identity),
+        ("RH_1_1_1",    "%",      "RH",          identity),
+        ("PA_1_1_1",    "kPa",    "LI_Pres_Avg", x -> x + 80.0),
+        ("SW_IN_1_1_1", "W+1M-2", "SWdown1",     identity),
+        ("LW_IN_1_1_1", "W+1M-2", "LWdown1",     identity),
+    ],
+    "LOWER" => [
+        ("TA_1_1_1",    "C",      "Temp_16m_Avg",        identity),
+        ("RH_1_1_1",    "%",      "RH_16m_Avg",          identity),
+        ("PA_1_1_1",    "kPa",    "AP_16m_Avg",          identity),
+        ("SW_IN_1_1_1", "W+1M-2", "Incoming_SW_16m_Avg", identity),
+        ("LW_IN_1_1_1", "W+1M-2", "Incoming_LW_16m_Avg", identity),
+    ],
+    "UPPER" => [
+        ("TA_1_1_1",    "C",      "Temp_26m_Avg",        identity),
+        ("RH_1_1_1",    "%",      "RH_26m_Avg",          identity),
+        ("PA_1_1_1",    "kPa",    "AP_26m_Avg",          identity),
+        ("SW_IN_1_1_1", "W+1M-2", "Incoming_SW_26m_Avg", identity),
+        ("LW_IN_1_1_1", "W+1M-2", ["Incoming_LW_26m_Avg", "Incoming_UW_26m_Avg"], identity),  # 2025 logger program labelled it UW
+    ],
+    "BOTTOM" => [
+        ("TA_1_1_1",    "C",      "Temp_5m_Avg", identity),
+        ("SW_IN_1_1_1", "W+1M-2", "SWdn_5m",     identity),
+    ],
+)
+
+# Plausibility bounds per biomet variable; values outside are written as nodata.
+const BIOMET_BOUNDS = Dict(
+    "TA_1_1_1"    => (-60.0, 20.0),
+    "RH_1_1_1"    => (0.0, 100.0),
+    "PA_1_1_1"    => (75.0, 95.0),
+    "SW_IN_1_1_1" => (-20.0, 1300.0),
+    "LW_IN_1_1_1" => (10.0, 400.0),
+)
+
+"""
+    save_biomet_data(data::DataFrame, output_base::String, sensor::String;
+                     nodata::Float64=-9999.0)
+
+Write cleaned slow data as EddyPro external biomet files, one CSV per month:
+    `{output_base}/{sensor}_biomet_{yyyymm}.csv`
+
+File layout (what EddyPro 7 expects with "use native header"):
+    TIMESTAMP_1,TIMESTAMP_2,TA_1_1_1,RH_1_1_1,PA_1_1_1,SW_IN_1_1_1,LW_IN_1_1_1
+    yyyy-mm-dd,HHMM,C,%,kPa,W+1M-2,W+1M-2
+    2026-01-02,0000,-5.1200,71.3000,83.0250,412.1000,251.9000
+
+Data are kept at their native (1-min) resolution; EddyPro averages them over
+the flux averaging period. Missing or out-of-bounds values become `nodata`.
+Column selection and transforms come from `BIOMET_COLUMN_MAP[sensor]`.
+
+# Returns
+- `Vector{String}`: list of file paths written
+"""
+function save_biomet_data(data::DataFrame, output_base::String, sensor::String;
+                          nodata::Float64=-9999.0)
+    @assert "TIMESTAMP" in names(data) "DataFrame must have a TIMESTAMP column"
+    haskey(BIOMET_COLUMN_MAP, sensor) ||
+        throw(ArgumentError("No biomet column map defined for sensor \"$sensor\""))
+    # Resolve candidate source columns to the one actually present with data
+    cmap = [(bname, unit, _resolve_biomet_source(data, src), f)
+            for (bname, unit, src, f) in BIOMET_COLUMN_MAP[sensor]]
+
+    missing_src = [bname for (bname, _, src, _) in cmap if src === nothing]
+    isempty(missing_src) ||
+        @warn "save_biomet_data($sensor): no source column with data for $missing_src, written as nodata"
+
+    mkpath(output_base)
+    df = sort(unique(data, :TIMESTAMP), :TIMESTAMP)
+    df.month_ = Dates.format.(df.TIMESTAMP, "yyyymm")
+
+    header = join(["TIMESTAMP_1"; "TIMESTAMP_2"; [c[1] for c in cmap]], ",")
+    units  = join(["yyyy-mm-dd"; "HHMM"; [c[2] for c in cmap]], ",")
+
+    written = String[]
+    for month in sort(unique(df.month_))
+        mdf = df[df.month_ .== month, :]
+        fname = joinpath(output_base, "$(sensor)_biomet_$(month).csv")
+        open(fname, "w") do io
+            println(io, header)
+            println(io, units)
+            for row in eachrow(mdf)
+                vals = String[Dates.format(row.TIMESTAMP, "yyyy-mm-dd"),
+                              Dates.format(row.TIMESTAMP, "HHMM")]
+                for (bname, _, src, f) in cmap
+                    v = src === nothing ? missing : row[src]
+                    push!(vals, _biomet_value(v, f, get(BIOMET_BOUNDS, bname, (-Inf, Inf)), nodata))
+                end
+                println(io, join(vals, ","))
+            end
+        end
+        push!(written, fname)
+    end
+
+    println("Saved $(length(written)) monthly biomet files to $output_base")
+    return written
+end
+
+"""Return the first candidate column name that exists in `data` and has any
+non-missing, non-NaN value; `nothing` if none does."""
+function _resolve_biomet_source(data::DataFrame, src::Union{AbstractString,AbstractVector})
+    for c in (src isa AbstractString ? [src] : src)
+        c in names(data) || continue
+        any(v -> !(ismissing(v) || (v isa AbstractFloat && isnan(v))), data[!, c]) && return String(c)
+    end
+    return nothing
+end
+
+"""Format one biomet value: apply transform, bounds, nodata; 4 decimals."""
+function _biomet_value(v, f, bounds, nodata::Float64)
+    (ismissing(v) || (v isa AbstractFloat && isnan(v))) && return string(nodata)
+    x = f(Float64(v))
+    (isnan(x) || x < bounds[1] || x > bounds[2]) && return string(nodata)
+    return string(round(x; digits=4))
+end

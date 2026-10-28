@@ -1,43 +1,6 @@
-#!/usr/bin/env julia --project=@.
-# Run the EC processing pipeline for the SFC sensor.
-
-using Peddy
-using DimensionalData
-using Dates
-using DataFrames
-using Statistics
-using CSV
-
-include("../src/process_sensor.jl")
-include("../src/read_data,jl")
-include("../src/save_data.jl")
-
-# === Configuration ===
-input_base       = "/data/disk1/shared/PEA/data"
-processed_output = "/data/disk1/shared/PEA/processed_HF"
-slow_output = "/data/disk1/shared/PEA/processed_LF/SFC"
-
-year             = 2026
-
-# === Load and clean slow data ===
-println("Reading slow data for SFC...")
-slow_raw  = read_slow_data(base_path=input_base, sensor="SFC")
-slow_data = clean_slowdata(slow_raw)
-unique!(slow_data, :TIMESTAMP)
-sort!(slow_data, :TIMESTAMP)
-println("  $(nrow(slow_data)) slow records loaded")
-
-# === Save slow data (including wind columns) ===
-println("Saving slow data (OneMin) with wind columns...")
-save_slow_data(slow_data, slow_output, "SFC")
-
-# === Process ===
-# Pass --restart to reprocess all dates; default resumes from where it left off.
-process_sensor(
-    input_base       = input_base,
-    sensor           = "SFC",
-    processed_output = processed_output,
-    year             = year,
-    resume           = !("--restart" in ARGS),
-    slow_data        = slow_data,
-)
+#!/usr/bin/env julia
+# Run the EC processing pipeline for the SFC sensor (own slow data as H2O reference).
+# Thin wrapper around run_sensor.jl: resume mode by default; --restart / --from / --to /
+# --slow-only / --no-save-slow and the PEA_* environment are documented there.
+pushfirst!(ARGS, "SFC")
+include("run_sensor.jl")

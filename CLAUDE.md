@@ -11,13 +11,11 @@ Eddy covariance (EC) data processing pipeline for snow research stations, built 
 ```
 EC_processing.ipynb              ← Main pipeline notebook (runs end-to-end)
 src/read_data,jl                 ← Data readers: read_fast_data(), read_slow_data(), clean_slowdata()
-src/save_data.jl                 ← TOA5-format writer: save_slow_data()
+src/save_data.jl                 ← TOA5-format writer save_slow_data(); EddyPro biomet writer save_biomet_data()
 src/process_sensor.jl            ← Core pipeline engine: process_sensor()
-scripts/run_SFC.jl               ← Per-station entry points (SFC/BOTTOM: own slow data)
-scripts/run_BOTTOM.jl
-scripts/run_sensor.jl            ← Env-configurable driver with the H2O reference chain (LOWER/UPPER)
-scripts/run_LOWER.jl             ← Wrappers around run_sensor.jl
-scripts/run_UPPER.jl
+scripts/run_sensor.jl            ← Driver for all four sensors (env/option-configurable, H2O reference chain)
+scripts/run_{SFC,LOWER,UPPER,BOTTOM}.jl ← Thin wrappers around run_sensor.jl (cron entry points)
+scripts/run_slow.jl              ← Slow data + Julia biomet writer only (PC layout, EC_ROOT)
 scripts/run_mrd.jl               ← MRD post-processor
 scripts/plot_raw_vs_processed.jl ← Visualization
 Peddy.jl/                        ← Local dev copy of the EC processing library (separate repo)
@@ -40,7 +38,20 @@ julia --project=Peddy.jl -e 'using Pkg; Pkg.test()'
 julia --project=Peddy.jl/docs -e 'using Pkg; Pkg.instantiate(); include("Peddy.jl/docs/make.jl")'
 ```
 
-Julia 1.11+ is required.
+Julia 1.11+ is required. Peddy.jl is pinned in `Manifest.toml` to branch `fix_licor` of
+github.com/pleibers/Peddy.jl at the tree of commit fe0c4c3 (the "v3" processing: sonic `diag_margin`,
+Ts rolling-median check, `couple_sonic` despiking). `Pkg.update("Peddy")` would move it; do not run it
+without re-validating the output.
+
+## Processing versions
+
+- **v3** (reference since Oct 2026, identical on all machines): `SENSORS` in `src/process_sensor.jl`
+  (`diag_margin` SFC 0 / towers 2, `pres_offset` 80 kPa for SFC), `ts_max_deviation` 10 K,
+  `couple_sonic=true`, `max_gap_samples` 5, H2O bounds 0–400 mmol/m³, reference grid with ≤10 min
+  interpolation. Overrides: `--diag_margin=`, `--ts_max_deviation=` on `run_sensor.jl`.
+- The merged driver `scripts/run_sensor.jl` accepts both the workstation style
+  (`PEA_*` env, `--from/--to/--restart/--slow-only`) and the PC style (`SENSOR YEAR`, `EC_ROOT`,
+  `--input= --out= --dates= --months= --logtag=`). See its header.
 
 ## Peddy.jl Unit Conventions (Critical)
 
@@ -55,11 +66,11 @@ These are verified from source and diverge from what some metadata files claim:
 | TA (slow) | °C | Magnus formula expects Celsius |
 | RH (slow) | fraction 0–1 | Peddy does `* 100` internally — do NOT pass percentage |
 
-`clean_tower_slowdata` returns RH in **percent** (raw tower RH_16m/RH_26m are 0–1 and are auto-scaled; RH_10m/RH_5m are already percent); `build_lf_dimarray`/`_regular_lf_window` divide by 100 before handing the reference to Peddy. Logger code `-7999` is masked there as well.
+`clean_tower_slowdata` returns RH in **percent** (raw tower RH_16m/RH_26m are 0–1 and are auto-scaled; RH_10m/RH_5m are already percent); `build_lf_dimarray`/`_lf_grid` divide by 100 before handing the reference to Peddy. Logger code `-7999` is masked there as well.
 
 ## H2O reference chain (LOWER/UPPER)
 
-`H2O_REF_CHAIN` in `src/read_data,jl`: LOWER = own 16 m → UPPER 26 m → LOWER-logger 10 m probe; UPPER = own 26 m → 10 m probe. `build_reference_chain` merges the sources minute by minute (first valid wins, `REF_SRC` = source index, 9 = interpolated gap ≤ 10 min). `process_sensor(...; ref_data=ref)` uses it instead of `slow_data`; the reference is placed on a regular 1-min grid spanning the day's fast data with NaN gaps, so Peddy's nearest-minute matching never uses a reference hours away (NaN reference → NaN H2O). After the pipeline H2O outside 0–400 mmol/m³ is set to NaN. Per-day source counts go to `{S}_h2o_ref_{YYYYMM}.csv` next to the processing log. Only the sensor's own cleaned slow data is written as OneMin files.
+`H2O_REF_CHAIN` in `src/read_data,jl`: LOWER = own 16 m → UPPER 26 m → LOWER-logger 10 m probe; UPPER = own 26 m → 10 m probe. `build_reference_chain` merges the sources minute by minute (first valid wins, `REF_SRC` = source index, 9 = interpolated gap ≤ 10 min). `process_sensor(...; ref_data=ref)` uses it instead of `slow_data`; the reference is placed on a regular 1-min grid from day−1 h to day+1 d+1 h with NaN gaps, so Peddy's nearest-minute matching never uses a reference hours away (NaN reference → NaN H2O). After the pipeline H2O outside 0–400 mmol/m³ is set to NaN. Per-day source counts go to `{S}_h2o_ref_{YYYYMM}.csv` next to the processing log. Only the sensor's own cleaned slow data is written as OneMin files. Days without any reference minute get NaN H2O. SFC uses its own cleaned slow data (no chain); BOTTOM has no gas analyzer.
 
 ## Peddy.jl Pipeline Steps
 
