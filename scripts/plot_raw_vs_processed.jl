@@ -14,10 +14,9 @@ include("../src/read_data,jl")
 
 # === Configuration ===
 sensor         = "LOWER"
-input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transfer/"
-# input_base     = "/home/engbers/Documents/PhD/EC_data_convert/2025/converted/" 
-processed_base = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor"
-plot_dir       = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor/plots"
+input_base     = "/data/disk1/shared/PEA/data"
+processed_base = "/data/disk1/shared/PEA/processed_HF/$sensor"
+plot_dir       = "/data/disk1/shared/PEA/processed_HF/$sensor/plots"
 mkpath(plot_dir)
 
 # Variables to plot: (raw_column, processed_column, label)

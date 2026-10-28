@@ -858,35 +858,125 @@ function clean_slowdata(slowdata::DataFrame)
     return slowdata_cleaned
 end
 
+# ===== Logger-code masking and H2O reference chain =====
+
+"""
+    mask_logger_codes!(df::DataFrame; codes=(-7999.0,)) -> DataFrame
+
+Replace logger "no data" codes (Campbell -7999) by `missing` in every numeric column.
+Must run before any unit scaling (otherwise RH -7999 becomes -799900).
+"""
+function mask_logger_codes!(df::DataFrame; codes=(-7999.0,), tol=1e-6)
+    total = 0
+    for c in names(df)
+        c == "TIMESTAMP" && continue
+        nonmissingtype(eltype(df[!, c])) <: Real || continue
+        col = df[!, c]
+        hits = [!ismissing(v) && any(code -> abs(v - code) <= tol, codes) for v in col]
+        n = count(hits)
+        n == 0 && continue
+        df[!, c] = allowmissing(col)
+        df[hits, c] .= missing
+        total += n
+    end
+    println("  masked $total logger-code cells (codes=$(codes))")
+    return df
+end
+
+"""
+    mask_logger_zeros!(df::DataFrame, ta::String, rh::String) -> Int
+
+Rows where TA == 0 and RH == 0 exactly are logger zeros, not measurements: set both to missing.
+"""
+function mask_logger_zeros!(df::DataFrame, ta::String, rh::String)
+    (ta in names(df) && rh in names(df)) || return 0
+    df[!, ta] = allowmissing(df[!, ta])
+    df[!, rh] = allowmissing(df[!, rh])
+    z = coalesce.((df[!, ta] .== 0) .& (df[!, rh] .== 0), false)
+    n = count(z)
+    if n > 0
+        df[z, ta] .= missing
+        df[z, rh] .= missing
+    end
+    println("  masked $n logger-zero rows ($ta/$rh)")
+    return n
+end
+
+"""
+    rh_to_percent!(df::DataFrame, col::String; mode=:auto) -> Bool
+
+Bring an RH column to percent. `:auto` multiplies by 100 when the maximum valid value
+is <= 1.5 (fraction), `:fraction` always multiplies, `:percent` never. Returns true if scaled.
+"""
+function rh_to_percent!(df::DataFrame, col::String; mode::Symbol=:auto)
+    col in names(df) || return false
+    vals = [Float64(v) for v in df[!, col] if !ismissing(v) && !(v isa AbstractFloat && isnan(v))]
+    isempty(vals) && return false
+    mx = maximum(vals)
+    scale = mode == :fraction || (mode == :auto && mx <= 1.5)
+    if scale
+        df[!, col] = df[!, col] .* 100
+        println("  $col: fraction → percent (×100; max was $(round(mx, digits=3)))")
+    else
+        println("  $col: kept as percent (max $(round(mx, digits=1)))")
+    end
+    return scale
+end
+
+# Set values outside [lo, hi] to missing; returns the number of masked cells.
+function _bound_missing!(df::DataFrame, col::String, lo, hi)
+    col in names(df) || return 0
+    v = df[!, col]
+    bad = coalesce.((v .< lo) .| (v .> hi), false)
+    n = count(bad)
+    if n > 0
+        df[!, col] = allowmissing(v)
+        df[bad, col] .= missing
+        println("  $col: $n values outside [$lo, $hi] → missing")
+    end
+    return n
+end
+
 """
     clean_tower_slowdata(slowdata::DataFrame, suffix::String)
 
 Clean slow data for tower sensors (LOWER, UPPER, BOTTOM).
-Suffix is the height tag, e.g. "_16m", "_26m", "_5m".
+Suffix is the height tag of the sensor's own probe, e.g. "_16m", "_26m", "_5m".
 
-Performs:
-- Physical bounds on Temp_{h}m_Avg: -60 to 20 °C
+Performs, in this order:
+- Masks logger codes (-7999) in all numeric columns and logger zeros (TA==0 && RH==0)
+  for every Temp_Xm_Avg/RH_Xm_Avg pair present
+- Physical bounds on every Temp_Xm_Avg: -60 to 20 °C
+- Every RH_Xm_Avg brought to percent (auto-detects 0–1 fractions), bounded 0–105 %
+- Every AP_Xm_Avg bounded 50–110 kPa
 - Converts FluxWind columns from km/h to m/s
 - Drops diagnostic, redundant, and metadata columns
 """
 function clean_tower_slowdata(slowdata::DataFrame, suffix::String)
     cleaned = copy(slowdata)
+    println("Cleaning tower slow data (suffix=$suffix): $(nrow(cleaned)) rows")
 
-    # Temperature bounds: Temp_{h}m_Avg between -60 and 20 °C
-    temp_col = "Temp$(suffix)_Avg"
-    if temp_col in names(cleaned)
-        cleaned[!, temp_col] = ifelse.(
-            coalesce.((cleaned[!, temp_col] .> 20) .| (cleaned[!, temp_col] .< -60), false),
-            missing,
-            cleaned[!, temp_col]
-        )
+    mask_logger_codes!(cleaned)
+
+    heights = String[]
+    for c in names(cleaned)
+        m = match(r"^Temp_(\d+m)_Avg$", c)
+        m === nothing || push!(heights, m.captures[1])
+    end
+    for h in heights
+        mask_logger_zeros!(cleaned, "Temp_$(h)_Avg", "RH_$(h)_Avg")
+        _bound_missing!(cleaned, "Temp_$(h)_Avg", -60, 20)
     end
 
-    # Convert RH_16m_Avg and RH_26m_Avg from fraction (0–1) to percentage (0–100)
-    for rh_col in ["RH_16m_Avg", "RH_26m_Avg"]
-        if rh_col in names(cleaned)
-            cleaned[!, rh_col] = cleaned[!, rh_col] .* 100
-        end
+    for c in names(cleaned)
+        occursin(r"^RH_\d+m_Avg$", c) || continue
+        rh_to_percent!(cleaned, c)
+        _bound_missing!(cleaned, c, 0, 105)
+    end
+
+    for c in names(cleaned)
+        occursin(r"^AP_\d+m_Avg$", c) || continue
+        _bound_missing!(cleaned, c, 50, 110)
     end
 
     # Convert FluxWind columns from km/h to m/s (only LOWER has these)
@@ -921,6 +1011,148 @@ function clean_tower_slowdata(slowdata::DataFrame, suffix::String)
     println("  Cleaned columns: ", join(names(cleaned), ", "))
 
     return cleaned
+end
+
+# ----- H2O reference chain ---------------------------------------------------
+
+"""
+Default TA/RH reference sources for the LI-7500 H2O correction, in priority order.
+Each entry: (sensor whose slow files are read, suffix passed to clean_tower_slowdata,
+TA column, RH column). Minute by minute the first entry with valid TA and RH wins.
+Override per run with ENV["PEA_REF_CHAIN_<SENSOR>"] = "SENSOR:suffix:TAcol:RHcol,...".
+"""
+const H2O_REF_CHAIN = Dict(
+    "LOWER" => [
+        (sensor="LOWER", suffix="_16m", ta="Temp_16m_Avg", rh="RH_16m_Avg"),   # own 16 m probe
+        (sensor="UPPER", suffix="_26m", ta="Temp_26m_Avg", rh="RH_26m_Avg"),   # UPPER 26 m probe (absolute humidity transfer)
+        (sensor="LOWER", suffix="_16m", ta="Temp_10m_Avg", rh="RH_10m_Avg"),   # 10 m probe on the LOWER logger
+    ],
+    "UPPER" => [
+        (sensor="UPPER", suffix="_26m", ta="Temp_26m_Avg", rh="RH_26m_Avg"),   # own 26 m probe
+        (sensor="LOWER", suffix="_16m", ta="Temp_10m_Avg", rh="RH_10m_Avg"),   # 10 m probe on the LOWER logger
+    ],
+)
+
+"""
+    parse_ref_chain(spec::AbstractString)
+
+Parse "SENSOR:suffix:TAcol:RHcol,SENSOR:suffix:TAcol:RHcol,..." into chain entries.
+"""
+function parse_ref_chain(spec::AbstractString)
+    out = NamedTuple{(:sensor, :suffix, :ta, :rh), NTuple{4, String}}[]
+    for item in split(spec, ',')
+        p = split(strip(item), ':')
+        length(p) == 4 || error("Bad reference chain item '$item' (expected SENSOR:suffix:TAcol:RHcol)")
+        push!(out, (sensor=String(p[1]), suffix=String(p[2]), ta=String(p[3]), rh=String(p[4])))
+    end
+    return out
+end
+
+"""
+    load_cleaned_slow!(cache, sensor, suffix; input_base) -> DataFrame
+
+Read and clean the slow data of `sensor` once; later calls return the cached frame.
+"""
+function load_cleaned_slow!(cache::Dict{String, DataFrame}, sensor::String, suffix::String; input_base::String)
+    haskey(cache, sensor) && return cache[sensor]
+    println("Reading slow data for $sensor ...")
+    raw = read_slow_data(base_path=input_base, sensor=sensor)
+    if nrow(raw) == 0
+        @warn "No slow data found for $sensor under $input_base"
+        cache[sensor] = DataFrame(TIMESTAMP=DateTime[])
+        return cache[sensor]
+    end
+    unique!(raw, :TIMESTAMP)
+    sort!(raw, :TIMESTAMP)
+    cache[sensor] = clean_tower_slowdata(raw, suffix)
+    println("  $(nrow(cache[sensor])) slow records for $sensor")
+    return cache[sensor]
+end
+
+"""
+    build_reference_chain(chain; input_base, cache=Dict()) -> DataFrame
+
+Build the minute-by-minute TA/RH reference for the H2O correction from an ordered
+list of sources (see `H2O_REF_CHAIN`). Returns a DataFrame on a regular 1-min grid
+spanning all sources with columns `TIMESTAMP`, `TA_ref` (°C), `RH_ref` (%), and
+`REF_SRC` (1-based index of the chain entry used; 0 = no reference; 9 = interpolated).
+"""
+function build_reference_chain(chain; input_base::String, cache::Dict{String, DataFrame}=Dict{String, DataFrame}())
+    sources = [load_cleaned_slow!(cache, e.sensor, e.suffix; input_base=input_base) for e in chain]
+
+    tmin = nothing; tmax = nothing
+    for df in sources
+        nrow(df) == 0 && continue
+        a, b = extrema(df.TIMESTAMP)
+        tmin = tmin === nothing ? a : min(tmin, a)
+        tmax = tmax === nothing ? b : max(tmax, b)
+    end
+    if tmin === nothing
+        @warn "No slow data found for any reference source"
+        return DataFrame(TIMESTAMP=DateTime[], TA_ref=Float64[], RH_ref=Float64[], REF_SRC=Int[])
+    end
+
+    grid = collect(floor(tmin, Minute):Minute(1):ceil(tmax, Minute))
+    n = length(grid)
+    ta = fill(NaN, n); rh = fill(NaN, n); src = zeros(Int, n)
+    index = Dict(t => i for (i, t) in enumerate(grid))
+
+    println("Building H2O reference chain ($(length(chain)) sources):")
+    for (k, (e, df)) in enumerate(zip(chain, sources))
+        if !(e.ta in names(df) && e.rh in names(df))
+            println("  [$k] $(e.sensor) $(e.ta)/$(e.rh): columns not available — skipped")
+            continue
+        end
+        filled = 0
+        for (t, a, b) in zip(df.TIMESTAMP, df[!, e.ta], df[!, e.rh])
+            (ismissing(a) || ismissing(b)) && continue
+            fa = Float64(a); fb = Float64(b)
+            (isnan(fa) || isnan(fb)) && continue
+            i = get(index, floor(t, Minute), 0)
+            i == 0 && continue
+            src[i] == 0 || continue
+            ta[i] = fa; rh[i] = fb; src[i] = k; filled += 1
+        end
+        println("  [$k] $(e.sensor) $(e.ta)/$(e.rh): $filled minutes")
+    end
+    println("  grid $(grid[1]) → $(grid[end]): $n minutes, $(count(==(0), src)) without reference")
+    return DataFrame(TIMESTAMP=grid, TA_ref=ta, RH_ref=rh, REF_SRC=src)
+end
+
+"""
+    interpolate_short_gaps!(ref::DataFrame; max_gap_minutes=10) -> Int
+
+Linearly fill reference gaps of at most `max_gap_minutes` bounded by valid minutes
+on both sides; filled minutes get `REF_SRC = 9`.
+"""
+function interpolate_short_gaps!(ref::DataFrame; max_gap_minutes::Int=10)
+    n = nrow(ref)
+    ta = ref.TA_ref; rh = ref.RH_ref; src = ref.REF_SRC
+    filled = 0
+    i = 1
+    while i <= n
+        if src[i] == 0
+            j = i
+            while j <= n && src[j] == 0
+                j += 1
+            end
+            gap = j - i
+            if i > 1 && j <= n && gap <= max_gap_minutes
+                for m in i:(j - 1)
+                    α = (m - (i - 1)) / (j - (i - 1))
+                    ta[m] = ta[i - 1] + α * (ta[j] - ta[i - 1])
+                    rh[m] = rh[i - 1] + α * (rh[j] - rh[i - 1])
+                    src[m] = 9
+                end
+                filled += gap
+            end
+            i = j
+        else
+            i += 1
+        end
+    end
+    println("  interpolated $filled reference minutes (gaps ≤ $max_gap_minutes min)")
+    return filled
 end
 
 # Helper function for linear interpolation

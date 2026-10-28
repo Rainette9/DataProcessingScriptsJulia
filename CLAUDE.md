@@ -13,10 +13,11 @@ EC_processing.ipynb              ← Main pipeline notebook (runs end-to-end)
 src/read_data,jl                 ← Data readers: read_fast_data(), read_slow_data(), clean_slowdata()
 src/save_data.jl                 ← TOA5-format writer: save_slow_data()
 src/process_sensor.jl            ← Core pipeline engine: process_sensor()
-scripts/run_SFC.jl               ← Per-station entry points
-scripts/run_LOWER.jl
-scripts/run_UPPER.jl
+scripts/run_SFC.jl               ← Per-station entry points (SFC/BOTTOM: own slow data)
 scripts/run_BOTTOM.jl
+scripts/run_sensor.jl            ← Env-configurable driver with the H2O reference chain (LOWER/UPPER)
+scripts/run_LOWER.jl             ← Wrappers around run_sensor.jl
+scripts/run_UPPER.jl
 scripts/run_mrd.jl               ← MRD post-processor
 scripts/plot_raw_vs_processed.jl ← Visualization
 Peddy.jl/                        ← Local dev copy of the EC processing library (separate repo)
@@ -54,6 +55,12 @@ These are verified from source and diverge from what some metadata files claim:
 | TA (slow) | °C | Magnus formula expects Celsius |
 | RH (slow) | fraction 0–1 | Peddy does `* 100` internally — do NOT pass percentage |
 
+`clean_tower_slowdata` returns RH in **percent** (raw tower RH_16m/RH_26m are 0–1 and are auto-scaled; RH_10m/RH_5m are already percent); `build_lf_dimarray`/`_regular_lf_window` divide by 100 before handing the reference to Peddy. Logger code `-7999` is masked there as well.
+
+## H2O reference chain (LOWER/UPPER)
+
+`H2O_REF_CHAIN` in `src/read_data,jl`: LOWER = own 16 m → UPPER 26 m → LOWER-logger 10 m probe; UPPER = own 26 m → 10 m probe. `build_reference_chain` merges the sources minute by minute (first valid wins, `REF_SRC` = source index, 9 = interpolated gap ≤ 10 min). `process_sensor(...; ref_data=ref)` uses it instead of `slow_data`; the reference is placed on a regular 1-min grid spanning the day's fast data with NaN gaps, so Peddy's nearest-minute matching never uses a reference hours away (NaN reference → NaN H2O). After the pipeline H2O outside 0–400 mmol/m³ is set to NaN. Per-day source counts go to `{S}_h2o_ref_{YYYYMM}.csv` next to the processing log. Only the sensor's own cleaned slow data is written as OneMin files.
+
 ## Peddy.jl Pipeline Steps
 
 Configured via `EddyPipeline(; sensor, quality_control, gas_analyzer, despiking, make_continuous, gap_filling, double_rotation, mrd, output)`. Each step is optional (set to `nothing` to skip). Execution order is fixed: QC → gas analyzer → despiking → make continuous → gap filling → double rotation → MRD → output.
@@ -73,3 +80,6 @@ Four stations: `"SFC"`, `"LOWER"`, `"UPPER"`, `"BOTTOM"`. TOA5 format: 4 header 
 - LI-7500 diagnostic: if constant at 247 (above default threshold 240), set `diag_gas=255` in `LICOR()` constructor to avoid NaN-ing all H2O/P data.
 - `skipmissing()` does NOT filter `Float64` NaN values — use `filter(!isnan, ...)` for statistics on pipeline output.
 - ICSV output uses `nodata=-9999.0`; read back with `CSV.read(...; missingstring="-9999.0")`.
+- Raw daily fast files span ~25 h and `read_fast_data(dates=[d])` also loads the neighbouring file; `process_sensor` filters each day to its calendar day before processing (otherwise ~2 days are processed and the neighbour's hourly files overwritten).
+- `process_sensor` appends to an existing monthly processing log when `resume=true` (the daily cron) and only starts a fresh log with `--restart`.
+- `data/_raw/{SENSOR}` is walked by the readers too (path contains the sensor name); harmless but slow.

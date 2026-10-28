@@ -18,8 +18,8 @@ using Glob
 
 # === Configuration ===
 sensor       = "BOTTOM"
-input_base   = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF/$sensor"
-output_path  = "/home/engbers/Documents/PhD/EC_data_convert/2026/MRD/$sensor"
+input_base   = "/data/disk1/shared/PEA/processed_HF/$sensor"
+output_path  = "/data/disk1/shared/PEA/MRD/$sensor"
 mkpath(output_path)
 
 fo = Peddy.FileOptions(

@@ -909,7 +909,7 @@ version = "2.8.3"
 deps = ["CSV", "DataFrames", "Dates", "DimensionalData", "Glob", "InteroperableCSV", "Interpolations", "LaTeXStrings", "NCDatasets", "Plots", "Polynomials", "ProgressMeter", "RecipesBase", "Reexport", "Statistics"]
 git-tree-sha1 = "702ee6ebceb3039c649cc7f5a172bafb3f56c504"
 repo-rev = "fix_licor"
-repo-url = "../Peddy.jl"
+repo-url = "https://github.com/pleibers/Peddy.jl.git"
 uuid = "0ce30ac1-e258-4977-baf6-e7a1803367e2"
 version = "0.1.0"
 

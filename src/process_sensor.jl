@@ -48,35 +48,65 @@ function build_hf_dimarray(fast_data::DataFrame, meta)
 end
 
 """
-    build_lf_dimarray(slow_data::DataFrame, meta, date::Date) -> Union{DimArray, Nothing}
+    _regular_lf_window(times, ta, rh, hf_start::DateTime, hf_end::DateTime) -> Union{DimArray, Nothing}
 
-Filter slow data to a single day and build a low-frequency DimArray with TA and
-RH columns. RH is divided by 100 to convert from percentage to fraction.
-Returns `nothing` if no data is available for the given day.
+Place TA (°C) / RH (%) samples on a regular 1-min grid covering the high-frequency
+data (`hf_start`, `hf_end`, padded by one minute), NaN where no sample exists, and
+return a `(Ti, Var)` DimArray with `:TA` and `:RH` (RH as fraction 0–1, as Peddy
+expects). Returns `nothing` only when no sample at all falls inside the window.
+Because the grid spans every HF sample, Peddy's nearest-minute matching never
+reaches a reference hours away: minutes without a reference stay NaN and the HF
+samples there get NaN H2O.
 """
-function build_lf_dimarray(slow_data::DataFrame, meta, date::Date)
+function _regular_lf_window(times, ta, rh, hf_start::DateTime, hf_end::DateTime)
+    w0 = floor(hf_start, Minute) - Minute(1)
+    w1 = ceil(hf_end, Minute) + Minute(2)
+    grid = collect(w0:Minute(1):(w1 - Minute(1)))
+    gta = fill(NaN, length(grid))
+    grh = fill(NaN, length(grid))
+    any_row = false
+    for (t, a, b) in zip(times, ta, rh)
+        (t >= w0 && t < w1) || continue
+        any_row = true
+        i = Dates.value(floor(t, Minute) - w0) ÷ 60_000 + 1
+        gta[i] = ismissing(a) ? NaN : Float64(a)
+        grh[i] = ismissing(b) ? NaN : Float64(b)
+    end
+    any_row || return nothing
+    return DimArray(hcat(gta, grh ./ 100), (Ti(grid), Var([:TA, :RH])))
+end
+
+"""
+    build_lf_dimarray(slow_data::DataFrame, meta, hf_start, hf_end)
+
+Legacy path (SFC/BOTTOM): reference from the sensor's own `meta.ta_col`/`meta.rh_col`
+(RH in percent). See `_regular_lf_window`.
+"""
+function build_lf_dimarray(slow_data::DataFrame, meta, hf_start::DateTime, hf_end::DateTime)
     ta_name = string(meta.ta_col)
     rh_name = string(meta.rh_col)
+    (ta_name in names(slow_data) && rh_name in names(slow_data)) || return nothing
+    return _regular_lf_window(slow_data.TIMESTAMP, slow_data[!, ta_name], slow_data[!, rh_name], hf_start, hf_end)
+end
 
-    if !(ta_name in names(slow_data) && rh_name in names(slow_data))
-        return nothing
-    end
+"""
+    build_lf_dimarray(ref::DataFrame, hf_start, hf_end)
 
-    day_start = DateTime(date)
-    day_end   = DateTime(date + Day(1))
-    day_slow  = filter(r -> r.TIMESTAMP >= day_start && r.TIMESTAMP < day_end, slow_data)
+Reference-chain path: `ref` has `TIMESTAMP`, `TA_ref`, `RH_ref` (see `build_reference_chain`).
+"""
+build_lf_dimarray(ref::DataFrame, hf_start::DateTime, hf_end::DateTime) =
+    _regular_lf_window(ref.TIMESTAMP, ref.TA_ref, ref.RH_ref, hf_start, hf_end)
 
-    if nrow(day_slow) == 0
-        return nothing
-    end
+"""
+    _ref_source_counts(ref::DataFrame, date::Date) -> NamedTuple
 
-    return DimArray(
-        hcat(
-            Float64.(coalesce.(day_slow[!, ta_name], NaN)),
-            Float64.(coalesce.(day_slow[!, rh_name], NaN)) ./ 100  # fraction 0–1
-        ),
-        (Ti(day_slow.TIMESTAMP), Var([:TA, :RH]))
-    )
+Minutes of the day by reference source (chain entries 1–4, 9 = interpolated, 0 = none).
+"""
+function _ref_source_counts(ref::DataFrame, date::Date)
+    d0 = DateTime(date); d1 = DateTime(date + Day(1))
+    src = ref.REF_SRC[(ref.TIMESTAMP .>= d0) .& (ref.TIMESTAMP .< d1)]
+    c(k) = count(==(k), src)
+    return (src1=c(1), src2=c(2), src3=c(3), src4=c(4), interp=c(9), none=c(0) + (1440 - length(src)))
 end
 
 """
@@ -115,7 +145,7 @@ Returns `(pipeline, output)`.
 """
 function make_pipeline(meta, cal_coeffs, has_slow;
                        spike_threshold, window_minutes, block_duration_min,
-                       max_gap_minutes, dt_ms, logger)
+                       max_gap_minutes, dt_ms, logger, gap_filling=true)
     peddy_sensor = meta.has_licor ? LICOR(calibration_coefficients=cal_coeffs) : CSAT3()
 
     has_gas_analyzer = meta.has_licor && cal_coeffs !== nothing && has_slow
@@ -148,7 +178,7 @@ function make_pipeline(meta, cal_coeffs, has_slow;
             variable_groups = var_groups,
         ),
         make_continuous = MakeContinuous(step_size_ms=dt_ms, max_gap_minutes=max_gap_minutes),
-        gap_filling     = GeneralInterpolation(),
+        gap_filling     = gap_filling ? GeneralInterpolation() : nothing,
         double_rotation = WindDoubleRotation(block_duration_minutes=block_duration_min),
         output          = output,
         logger          = logger,
@@ -162,7 +192,7 @@ end
 """
     process_sensor(; input_base, sensor, processed_output, year=2025,
                     dates=nothing, resume=true, config=Dict(),
-                    slow_data=DataFrame(), location=LocationMetadata(...))
+                    slow_data=DataFrame(), ref_data=nothing, location=LocationMetadata(...))
 
 Batch-process a full year of eddy covariance data for one sensor, day by day.
 
@@ -172,6 +202,14 @@ processed fast-data CSVs to `processed_output/{sensor}/{YYYYmm}/`.
 Slow data must be read, cleaned, and saved separately (see the notebook's
 slow-data cell) and passed in via the `slow_data` keyword argument.
 When `slow_data` is empty, the gas analyzer correction is skipped.
+
+`ref_data` (optional) is a minute-by-minute TA/RH reference built with
+`build_reference_chain` (columns `TIMESTAMP`, `TA_ref`, `RH_ref`, `REF_SRC`).
+When given, it replaces `slow_data` as the source of the H2O correction
+reference, and a per-day source summary is written to
+`{processed_output}/{sensor}/{YYYYmm}/{sensor}_h2o_ref_{YYYYmm}.csv`.
+
+After the pipeline, H2O outside 0–400 mmol m⁻³ is set to NaN.
 
 When `resume=true` (default), dates that already have output files are skipped.
 Set `resume=false` to reprocess all dates from scratch (existing files are
@@ -185,6 +223,7 @@ overwritten).
 | `:window_minutes`        | Float64 | 5.0                                  |
 | `:block_duration_minutes`| Float64 | 30.0                                 |
 | `:max_gap_minutes`       | Float64 | 5.0                                  |
+| `:gap_filling`           | Bool    | true (false: removed samples stay NaN) |
 """
 function process_sensor(;
     input_base::String,
@@ -195,6 +234,7 @@ function process_sensor(;
     resume::Bool = true,
     config::Dict = Dict(),
     slow_data::DataFrame = DataFrame(),
+    ref_data::Union{Nothing, DataFrame} = nothing,
     location = LocationMetadata(
         latitude          = -71.949608,
         longitude         = 23.0,
@@ -209,14 +249,19 @@ function process_sensor(;
     window_minutes     = get(config, :window_minutes, 5.0)
     block_duration_min = get(config, :block_duration_minutes, 30.0)
     max_gap_minutes    = get(config, :max_gap_minutes, 5.0)
+    gap_filling        = get(config, :gap_filling, true)
 
     sensor_type = meta.has_licor ? :licor : :csat3
 
     println("=" ^ 60)
     println("Processing sensor: $sensor  (type: $sensor_type)")
     println("  TA column: $(meta.ta_col)  |  RH column: $(meta.rh_col)")
-    has_slow = nrow(slow_data) > 0
-    if has_slow
+    use_ref  = ref_data !== nothing && nrow(ref_data) > 0
+    has_slow = use_ref || nrow(slow_data) > 0
+    if use_ref
+        println("  H2O reference: chain, $(nrow(ref_data)) minutes " *
+                "($(ref_data.TIMESTAMP[1]) → $(ref_data.TIMESTAMP[end]))")
+    elseif has_slow
         println("  Slow data: $(nrow(slow_data)) records")
     else
         println("  Slow data: none provided — gas analyzer correction will be skipped")
@@ -280,7 +325,10 @@ function process_sensor(;
         log_metadata!(logger, "calibration_H20_Span", string(cal_coeffs.H20_Span))
     end
 
-    current_month = nothing
+    # Months whose logs this process has already opened. On the first touch of a
+    # month the processing log is overwritten unless resuming onto an existing
+    # file (the daily cron runs in resume mode and must not wipe earlier days).
+    months_started = Set{String}()
     log_file = ""
 
     # --- Day-by-day processing loop ---
@@ -302,42 +350,91 @@ function process_sensor(;
             unique!(fast_data, :TIMESTAMP)
             sort!(fast_data, :TIMESTAMP)
 
+            # Keep only this calendar day: the raw daily files overlap (each spans ~25 h and
+            # the reader also loads the neighbouring file), so without this filter every run
+            # reprocesses ~2 days and overwrites the neighbouring day's hourly output.
+            n_all = nrow(fast_data)
+            filter!(r -> Date(r.TIMESTAMP) == date, fast_data)
+            n_all > nrow(fast_data) && println("  Kept $(nrow(fast_data)) of $n_all records belonging to $date")
+            if nrow(fast_data) == 0
+                @warn "No fast data for $date after date filter — skipping"
+                continue
+            end
+
             # Detect sampling rate
             dt_ms = round(Int, median([Dates.value(d) for d in diff(fast_data.TIMESTAMP)]))
             println("  Records: $(nrow(fast_data))  Sampling: $(dt_ms) ms ($(round(1000.0/dt_ms, digits=1)) Hz)")
 
             # Build DimArrays
             high_frequency_data = build_hf_dimarray(fast_data, meta)
-            low_frequency_data  = has_slow ? build_lf_dimarray(slow_data, meta, date) : nothing
+            hf_t0, hf_t1 = extrema(fast_data.TIMESTAMP)
+            low_frequency_data  = use_ref  ? build_lf_dimarray(ref_data, hf_t0, hf_t1) :
+                                  has_slow ? build_lf_dimarray(slow_data, meta, hf_t0, hf_t1) : nothing
+            if use_ref
+                rc = _ref_source_counts(ref_data, date)
+                println("  Reference minutes: src1=$(rc.src1) src2=$(rc.src2) src3=$(rc.src3) " *
+                        "src4=$(rc.src4) interp=$(rc.interp) none=$(rc.none)")
+            end
 
-            if low_frequency_data === nothing && has_slow
-                println("  No slow data for $date — skipping gas analyzer correction")
+            no_reference_day = low_frequency_data === nothing && has_slow
+            if no_reference_day
+                println("  No slow data for $date — gas analyzer correction skipped" *
+                        (use_ref ? "; H2O will be set to NaN (no reference available)" : ""))
             end
 
             # Build pipeline (disable gas analyzer when no slow data for this day)
             day_has_slow = low_frequency_data !== nothing
             pipeline, output = make_pipeline(meta, cal_coeffs, day_has_slow;
                 spike_threshold, window_minutes, block_duration_min,
-                max_gap_minutes, dt_ms, logger)
+                max_gap_minutes, dt_ms, logger, gap_filling)
 
             process!(pipeline, high_frequency_data, low_frequency_data)
 
             # Extract results and write hourly dat files
             hf_result, _ = Peddy.get_results(output)
+
+            # Remove physically impossible H2O (mmol m-3) after the gas analyzer correction
+            vars_out = collect(dims(hf_result, Var))
+            ih = findfirst(==(:H2O), vars_out)
+            if ih !== nothing
+                M = parent(hf_result)
+                col = dimnum(hf_result, Var) == 2 ? (@view M[:, ih]) : (@view M[ih, :])
+                bad = .!isnan.(col) .& ((col .< 0) .| (col .> 400))
+                n_bad = count(bad)
+                col[bad] .= NaN
+                n_bad > 0 && println("  H2O outside 0–400 mmol/m3 → NaN: $n_bad samples")
+                if use_ref && no_reference_day
+                    # Reference chain in use but no reference minute for this day: the raw
+                    # LI-7500 H2O must not pass through uncorrected.
+                    col .= NaN
+                    println("  H2O set to NaN for the whole day (no reference)")
+                    log_event!(logger, :postprocess, :h2o_no_reference; variable=:H2O,
+                               note="no TA/RH reference for this day; H2O set to NaN")
+                end
+                log_event!(logger, :postprocess, :h2o_bounds; variable=:H2O, count=n_bad,
+                           note="samples outside 0-400 mmol/m3 set to NaN")
+            end
+
             n_written = _write_hourly_files(hf_result, fast_out_base, sensor, dt_ms)
             total_files += n_written
             println("  Wrote $n_written hourly dat files")
 
             # Write/append to monthly processing log
             month_str = Dates.format(date, "yyyymm")
-            if month_str != current_month
-                current_month = month_str
-                month_dir = joinpath(fast_out_base, month_str)
-                mkpath(month_dir)
-                log_file = joinpath(month_dir, "$(sensor)_processing_log_$(month_str).csv")
-                write_processing_log(logger, log_file)
-            else
-                write_processing_log(logger, log_file; append=true)
+            month_dir = joinpath(fast_out_base, month_str)
+            mkpath(month_dir)
+            log_file = joinpath(month_dir, "$(sensor)_processing_log_$(month_str).csv")
+            ref_file = joinpath(month_dir, "$(sensor)_h2o_ref_$(month_str).csv")
+            first_touch = !(month_str in months_started)
+            push!(months_started, month_str)
+            append_log = !first_touch || (resume && isfile(log_file))
+            write_processing_log(logger, log_file; append=append_log)
+            if use_ref
+                append_ref = !first_touch || (resume && isfile(ref_file))
+                open(ref_file, append_ref ? "a" : "w") do io
+                    append_ref || println(io, "date,src1,src2,src3,src4,interp,none")
+                    println(io, "$date,$(rc.src1),$(rc.src2),$(rc.src3),$(rc.src4),$(rc.interp),$(rc.none)")
+                end
             end
             reset!(logger)
 

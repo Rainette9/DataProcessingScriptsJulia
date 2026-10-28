@@ -13,9 +13,9 @@ include("../src/read_data,jl")
 include("../src/save_data.jl")
 
 # === Configuration ===
-input_base       = "/home/engbers/Documents/PhD/EC_data_convert/2026/data_transfer"
-processed_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_HF"
-slow_output = "/home/engbers/Documents/PhD/EC_data_convert/2026/processed_slow/BOTTOM"
+input_base       = "/data/disk1/shared/PEA/data"
+processed_output = "/data/disk1/shared/PEA/processed_HF"
+slow_output = "/data/disk1/shared/PEA/processed_LF/BOTTOM"
 year             = 2026
 
 # === Load slow data ===
