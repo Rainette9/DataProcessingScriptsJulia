@@ -4,44 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Eddy covariance (EC) data processing pipeline for snow research stations, built on the **Peddy.jl** library. The main workflow runs in `EC_processing.ipynb` (Jupyter notebook), reading raw TOA5 sensor data, processing it through Peddy's pipeline, and outputting results.
+Julia driver around the **Peddy.jl** library for the eddy-covariance (EC) fast data of the Princess
+Elisabeth Antarctica (PEA) mast: reads raw TOA5 logger files, runs Peddy's pipeline day by day and writes
+hourly processed files plus cleaned 1-min slow data. It is used as a git submodule of `PEA_pipeline`
+(github.com/Rainette9/PEA_pipeline), whose cron scripts call `scripts/run_sensor.jl`.
 
 ## Architecture
 
 ```
-EC_processing.ipynb              ← Main pipeline notebook (runs end-to-end)
-src/read_data,jl                 ← Data readers: read_fast_data(), read_slow_data(), clean_slowdata()
-src/save_data.jl                 ← TOA5-format writer save_slow_data(); EddyPro biomet writer save_biomet_data()
-src/process_sensor.jl            ← Core pipeline engine: process_sensor()
-scripts/run_sensor.jl            ← Driver for all four sensors (env/option-configurable, H2O reference chain)
-scripts/run_{SFC,LOWER,UPPER,BOTTOM}.jl ← Thin wrappers around run_sensor.jl (cron entry points)
-scripts/run_slow.jl              ← Slow data + Julia biomet writer only (PC layout, EC_ROOT)
-scripts/run_mrd.jl               ← MRD post-processor
-scripts/plot_raw_vs_processed.jl ← Visualization
-Peddy.jl/                        ← Local dev copy of the EC processing library (separate repo)
+scripts/run_sensor.jl            ← The entry point: run_sensor.jl SENSOR [YEAR] [options] (see its header)
+scripts/run_mrd.jl               ← MRD post-processor over processed fast data (manual)
+scripts/plot_raw_vs_processed.jl ← Raw vs processed plots per day (manual)
+src/process_sensor.jl            ← Core: process_sensor(), SENSORS config, make_pipeline(), hourly writer
+src/read_data,jl                 ← Readers read_fast_data()/read_slow_data(), slow-data cleaning, H2O reference chain
+src/save_data.jl                 ← TOA5-format writer save_slow_data() (OneMin files)
 ```
 
-**Data flow:** Raw TOA5 `.dat` files → `read_fast_data()`/`read_slow_data()` → DataFrame → convert to DimArray → `EddyPipeline.process!()` → output (ICSV/NetCDF/Memory)
+**Data flow:** raw TOA5 `.dat` → `read_fast_data()`/`read_slow_data()` → DataFrame → DimArray →
+`EddyPipeline.process!()` → `{S}_Fastdata_proc_{date}_{HHMM}.dat` (hourly, ICSV) + `{S}_OneMin_{date}.dat`.
+EddyPro biomet files are **not** written here; `PEA_pipeline/make_biomet.py` makes them from the OneMin files.
 
-**Note:** The file `src/read_data,jl` has a comma in its name, not a period. Include it with `include("../src/read_data,jl")` from scripts, or `include("src/read_data,jl")` from the project root.
+**Note:** `src/read_data,jl` has a comma in its name, not a period: `include("../src/read_data,jl")`.
 
 ## Key Commands
 
 ```bash
-# Activate project environment and run notebook
-julia --project=. -e 'using Pkg; Pkg.instantiate()'
-
-# Run Peddy.jl tests
-julia --project=Peddy.jl -e 'using Pkg; Pkg.test()'
-
-# Build Peddy.jl docs
-julia --project=Peddy.jl/docs -e 'using Pkg; Pkg.instantiate(); include("Peddy.jl/docs/make.jl")'
+julia --project=. -e 'using Pkg; Pkg.instantiate()'                 # once per machine
+julia --project=. scripts/run_sensor.jl LOWER                        # resume mode (daily cron)
+julia --project=. scripts/run_sensor.jl LOWER --restart --from 2026-10-20 --to 2026-10-20
 ```
+
+Paths come from the `PEA_*` environment (`PEA_INPUT_BASE`, `PEA_HF_OUT`, `PEA_LF_OUT`, `PEA_YEAR`) or the
+`--input= --out= --slow_out=` options; the `EC_ROOT` layout is the PC alternative. All documented in the
+header of `scripts/run_sensor.jl`.
 
 Julia 1.11+ is required. Peddy.jl is pinned in `Manifest.toml` to branch `fix_licor` of
 github.com/pleibers/Peddy.jl at the tree of commit fe0c4c3 (the "v3" processing: sonic `diag_margin`,
 Ts rolling-median check, `couple_sonic` despiking). `Pkg.update("Peddy")` would move it; do not run it
-without re-validating the output.
+without re-validating the output. There is no test suite here; validate changes by reprocessing one day into
+a scratch folder and comparing with `PEA_pipeline/tools/compare_hf.py` (0 differing values expected unless
+the change is meant to alter the output).
 
 ## Processing versions
 
@@ -49,9 +51,10 @@ without re-validating the output.
   (`diag_margin` SFC 0 / towers 2, `pres_offset` 80 kPa for SFC), `ts_max_deviation` 10 K,
   `couple_sonic=true`, `max_gap_samples` 5, H2O bounds 0–400 mmol/m³, reference grid with ≤10 min
   interpolation. Overrides: `--diag_margin=`, `--ts_max_deviation=` on `run_sensor.jl`.
-- The merged driver `scripts/run_sensor.jl` accepts both the workstation style
-  (`PEA_*` env, `--from/--to/--restart/--slow-only`) and the PC style (`SENSOR YEAR`, `EC_ROOT`,
-  `--input= --out= --dates= --months= --logtag=`). See its header.
+- The year only selects the LI-7500 calibration coefficients (`Peddy.default_calibration_coefficients`,
+  SFC 2024 vs ≥2025) and filters the dates; 2025 (logger-card raw, `TOA5_STN1fast_<N>.dat`) and 2026+
+  (FTP hourly files merged to daily) go through the same code. 2025 quirks are detected from the data
+  (RH fraction → percent, missing own slow data → reference chain).
 
 ## Peddy.jl Unit Conventions (Critical)
 
@@ -83,7 +86,7 @@ Configured via `EddyPipeline(; sensor, quality_control, gas_analyzer, despiking,
 
 ## Sensor Data
 
-Four stations: `"SFC"`, `"LOWER"`, `"UPPER"`, `"BOTTOM"`. TOA5 format: 4 header rows (metadata, column names, units, processing type), then CSV data.
+Four stations: `"SFC"`, `"LOWER"`, `"UPPER"`, `"BOTTOM"`. TOA5 format: 4 header rows (metadata, column names, units, processing type), then CSV data. The readers match files by name (`fast`, `OneMin`/`slow`, `wind`) inside any folder whose path contains the sensor name, and take dates from the TIMESTAMP column, so both the card and the FTP naming work.
 
 ## Known Pitfalls
 

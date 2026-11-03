@@ -1,7 +1,6 @@
 #!/usr/bin/env julia
-# Peddy fast-data driver for one sensor (SFC, LOWER, UPPER or BOTTOM).
-# The thin wrappers run_SFC.jl / run_LOWER.jl / run_UPPER.jl / run_BOTTOM.jl (daily cron,
-# resume mode) include this file; reruns call it directly.
+# Peddy fast-data driver for one sensor (SFC, LOWER, UPPER or BOTTOM); the daily cron runs it in
+# resume mode, reruns with --restart.
 #
 # Usage: julia --project=<DataProcessingScriptsJulia> scripts/run_sensor.jl SENSOR [YEAR] [options]
 #   --restart                 reprocess all dates (default: resume, skip dates with output)
@@ -29,8 +28,7 @@
 # src/read_data,jl (own probe → UPPER 26 m → LOWER-logger 10 m for LOWER; own probe → 10 m for
 # UPPER); BOTTOM has no gas analyzer. Only the sensor's own cleaned slow data is written as OneMin
 # files; the reference itself is never written. EddyPro biomet files are made from the OneMin
-# files by transfer_scripts/make_biomet.py (save_biomet_data in src/save_data.jl is the
-# equivalent Julia writer; it is not called here).
+# files by PEA_pipeline/make_biomet.py.
 
 using Peddy
 using DimensionalData
