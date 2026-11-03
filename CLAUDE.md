@@ -97,3 +97,4 @@ Four stations: `"SFC"`, `"LOWER"`, `"UPPER"`, `"BOTTOM"`. TOA5 format: 4 header 
 - Raw daily fast files span ~25 h and `read_fast_data(dates=[d])` also loads the neighbouring file; `process_sensor` filters each day to its calendar day before processing (otherwise ~2 days are processed and the neighbour's hourly files overwritten).
 - `process_sensor` appends to an existing monthly processing log when `resume=true` (the daily cron) and only starts a fresh log with `--restart`.
 - `data/_raw/{SENSOR}` is walked by the readers too (path contains the sensor name); harmless but slow.
+- Since 2026-10-31 the SFC logger names its files `peasfc_*_1990_01_01_0000_<real date>_<HHMM>.dat` (clock/program reset). `_merge_wind_data` therefore matches the wind file by the *last* `_YYYY_MM_DD_` in the OneMin name.

@@ -463,10 +463,12 @@ function _merge_wind_data(main_df::DataFrame, file_name::String, root::String, a
     isempty(wind_files) && return main_df, wind_units
 
     # Try date-based match: extract YYYY_MM_DD from the OneMin filename and find
-    # a wind file containing the same date string.
-    date_match = match(r"_(\d{4}_\d{2}_\d{2})_", file_name)
-    wind_file = if !isnothing(date_match)
-        date_str = date_match.captures[1]
+    # a wind file containing the same date string. Take the LAST date in the name:
+    # since 2026-10-31 the SFC logger writes peasfc_OneMin_1990_01_01_0000_<date>_<HHMM>.dat
+    # (1990-01-01 = logger default after a reset), and the first date would match every file.
+    date_matches = collect(eachmatch(r"_(\d{4}_\d{2}_\d{2})_", file_name))
+    wind_file = if !isempty(date_matches)
+        date_str = date_matches[end].captures[1]
         matched = filter(f -> occursin(date_str, f), wind_files)
         isempty(matched) ? nothing : first(matched)
     else
