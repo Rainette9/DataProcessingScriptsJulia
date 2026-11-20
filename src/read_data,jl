@@ -91,6 +91,7 @@ function read_fast_data(;
             target_end   = maximum(dates)
             first_idx = nothing
             last_idx  = nothing
+            last_seen = nothing   # (idx, date) of the last file whose first timestamp was read
 
             for (idx, file_name) in enumerate(fast_files)
                 file_path = joinpath(root, file_name)
@@ -99,6 +100,7 @@ function read_fast_data(;
                                       header=2, skipto=5, limit=1,
                                       silencewarnings=true, select=["TIMESTAMP"])
                     file_date = Date(_fix_timestamp(sample.TIMESTAMP[1]))
+                    last_seen = (idx, file_date)
                     # First file whose date is >= target_start (or earlier — might span)
                     if isnothing(first_idx) && file_date >= target_start
                         # Include the previous file too, it might span into our date
@@ -112,6 +114,15 @@ function read_fast_data(;
                 catch
                     continue
                 end
+            end
+
+            # No file here starts on or after target_start, but the directory's last file
+            # can still run into target_start when it starts the day before: it is the
+            # "previous file" of the first file in the next (month) directory. This holds the
+            # whole last day of a month when daily files start at 23:59 of the day before
+            # (ITD datasync 1.2), and the first hour of the 1st when they start at 00:59.
+            if isnothing(first_idx) && !isnothing(last_seen) && last_seen[2] == target_start - Day(1)
+                first_idx = last_seen[1]
             end
 
             # If first_idx was never set, all files in this directory predate
